@@ -24,4 +24,4 @@ jobs:
       - name: Run tests
         run: npm test
         env:
-          ROUTER_CONFIG_DIR: /tmp/ccr-ci-config
+          ROUTER_CONFIG_PATH: /tmp/ccr-ci-config/.claude-custom-router.json

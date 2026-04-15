@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 
 const TEST_PORT = 18082;
 const TEST_DIR = join(tmpdir(), `ccr-routing-test-${Date.now()}`);
-const CONFIG_PATH = join(TEST_DIR, 'custom-models.json');
+const CONFIG_PATH = join(TEST_DIR, '.claude-custom-router.json');
 const BASE_URL = `http://127.0.0.1:${TEST_PORT}`;
 
 // Minimal config with a model pointing to a non-existent backend
@@ -56,7 +56,7 @@ describe('HTTP Server Integration', () => {
       cwd: process.cwd(),
       env: {
         ...process.env,
-        ROUTER_CONFIG_DIR: TEST_DIR,
+        ROUTER_CONFIG_PATH: CONFIG_PATH,
         ROUTER_PORT: String(TEST_PORT),
       },
       stdio: ['pipe', 'pipe', 'pipe'],

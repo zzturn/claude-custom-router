@@ -7,8 +7,8 @@
  *
  * Anthropic API spec only - no format transformation needed.
  *
- * Config: ${ROUTER_CONFIG_DIR}/custom-models.json (default: ~/.claude/)
- * Custom scenarios: ${ROUTER_CONFIG_DIR}/custom-scenarios.mjs
+ * Config: ~/.claude-custom-router.json (or $ROUTER_CONFIG_PATH)
+ * Custom scenarios: ~/.claude-custom-scenarios.mjs (or $ROUTER_SCENARIOS_PATH)
  *
  * Usage:
  *   node custom-model-proxy.mjs          # Start proxy
@@ -16,8 +16,10 @@
  *   node custom-model-proxy.mjs --status # Check status
  *
  * Environment Variables:
- *   ROUTER_CONFIG_DIR  - Base directory for config files (default: ~/.claude)
- *   ROUTER_PORT        - Override port from config (default: 8082)
+ *   ROUTER_CONFIG_PATH     - Path to config file (default: ~/.claude-custom-router.json)
+ *   ROUTER_SCENARIOS_PATH  - Path to custom scenarios module
+ *   ROUTER_PORT            - Override port from config (default: 8082)
+ *   ROUTER_LOG_DIR         - Directory for logs (default: ~/.claude-custom-router.d)
  */
 
 import { createServer } from 'node:http';
@@ -33,23 +35,25 @@ import { randomInt } from 'node:crypto';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-/** @type {string} Base directory for all config/runtime files */
-const CONFIG_DIR = process.env.ROUTER_CONFIG_DIR || join(homedir(), '.claude');
+const HOME = homedir();
 
 /** @type {string} Path to model configuration file */
-const CONFIG_PATH = join(CONFIG_DIR, 'custom-models.json');
+const CONFIG_PATH = process.env.ROUTER_CONFIG_PATH || join(HOME, '.claude-custom-router.json');
 
 /** @type {string} Path to PID file for process management */
-const PID_PATH = join(CONFIG_DIR, 'custom-model-proxy.pid');
+const DATA_DIR = join(HOME, '.claude-custom-router.d');
+
+/** @type {string} Path to PID file */
+const PID_PATH = join(DATA_DIR, 'proxy.pid');
 
 /** @type {string} Directory for log files */
-const LOG_DIR = join(CONFIG_DIR, 'logs');
+const LOG_DIR = process.env.ROUTER_LOG_DIR || join(DATA_DIR, 'logs');
 
 /** @type {string} Path to main log file */
 const LOG_PATH = join(LOG_DIR, 'custom-model-proxy.log');
 
 /** @type {string} Path to custom scenarios module */
-const CUSTOM_SCENARIOS_PATH = join(CONFIG_DIR, 'custom-scenarios.mjs');
+const CUSTOM_SCENARIOS_PATH = process.env.ROUTER_SCENARIOS_PATH || join(HOME, '.claude-custom-scenarios.mjs');
 
 /** @type {string} Directory for debug dumps */
 const DEBUG_DIR = join(LOG_DIR, 'debug');
@@ -772,7 +776,7 @@ try { writeFileSync(LOG_PATH, ''); } catch {}
 const port = config.port || DEFAULT_PORT;
 server.listen(port, '127.0.0.1', () => {
   L.info(`Custom Model Proxy started on http://127.0.0.1:${port}`);
-  L.info(`Config dir: ${CONFIG_DIR}`);
+  L.info(`Config: ${CONFIG_PATH}`);
   L.info(`Models: ${Object.keys(config.models).join(', ') || 'none'}`);
   L.info(`Debug: ${config.debug ? 'ON' : 'OFF'}`);
   for (const [scenario, modelId] of Object.entries(config.Router)) {

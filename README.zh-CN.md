@@ -45,10 +45,10 @@ cd claude-custom-router
 
 ```bash
 # 复制示例配置
-cp config/custom-models.example.json ~/.claude/custom-models.json
+cp config/custom-models.example.json ~/.claude-custom-router.json
 
 # 编辑配置（填入你的 API Key 和模型端点）
-vim ~/.claude/custom-models.json
+vim ~/.claude-custom-router.json
 ```
 
 ### 启动
@@ -70,7 +70,7 @@ curl http://127.0.0.1:8082/health
 
 ## 配置详解
 
-配置文件：`~/.claude/custom-models.json`
+配置文件：`~/.claude-custom-router.json`（或 `$ROUTER_CONFIG_PATH`）
 
 ```json
 {
@@ -140,7 +140,7 @@ curl http://127.0.0.1:8082/health
 
 ## 自定义场景
 
-创建 `~/.claude/custom-scenarios.mjs` 添加自定义检测器：
+创建 `~/.claude-custom-scenarios.mjs`（或设置 `$ROUTER_SCENARIOS_PATH`）添加自定义检测器：
 
 ```javascript
 export const detectors = [
@@ -184,8 +184,10 @@ node src/custom-model-proxy.mjs --status # 查看状态
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `ROUTER_CONFIG_DIR` | `~/.claude` | 配置和运行时文件的基础目录 |
+| `ROUTER_CONFIG_PATH` | `~/.claude-custom-router.json` | 配置文件路径 |
+| `ROUTER_SCENARIOS_PATH` | `~/.claude-custom-scenarios.mjs` | 自定义场景模块路径 |
 | `ROUTER_PORT` | 配置文件中的端口（8082） | 覆盖代理端口 |
+| `ROUTER_LOG_DIR` | `~/.claude-custom-router.d/logs` | 日志目录 |
 
 ## 热重载
 
@@ -196,7 +198,7 @@ node src/custom-model-proxy.mjs --status # 查看状态
 在配置中设置 `"debug": true` 启用请求/响应转储：
 
 ```
-~/.claude/logs/debug/
+~/.claude-custom-router.d/logs/debug/
   └── <session-id>/
       ├── <timestamp>_<random>_<model>_req.json       # 原始请求
       ├── <timestamp>_<random>_<model>_processed.json  # 路由后请求

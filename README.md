@@ -46,10 +46,10 @@ cd claude-custom-router
 
 ```bash
 # Copy the example config and edit it
-cp config/custom-models.example.json ~/.claude/custom-models.json
+cp config/custom-models.example.json ~/.claude-custom-router.json
 
 # Edit with your API keys and model endpoints
-vim ~/.claude/custom-models.json
+vim ~/.claude-custom-router.json
 ```
 
 ### 3. Run
@@ -71,7 +71,7 @@ curl http://127.0.0.1:8082/health
 
 ## Configuration
 
-Config file: `~/.claude/custom-models.json` (or `${ROUTER_CONFIG_DIR}/custom-models.json`)
+Config file: `~/.claude-custom-router.json` (or `$ROUTER_CONFIG_PATH`)
 
 ```json
 {
@@ -154,7 +154,7 @@ The proxy strips the tag and routes to the specified model.
 
 ## Custom Scenarios
 
-Create `~/.claude/custom-scenarios.mjs` to add your own detectors:
+Create `~/.claude-custom-scenarios.mjs` (or set `$ROUTER_SCENARIOS_PATH`) to add your own detectors:
 
 ```javascript
 export const detectors = [
@@ -203,8 +203,10 @@ node src/custom-model-proxy.mjs --status
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ROUTER_CONFIG_DIR` | `~/.claude` | Base directory for config and runtime files |
+| `ROUTER_CONFIG_PATH` | `~/.claude-custom-router.json` | Path to config file |
+| `ROUTER_SCENARIOS_PATH` | `~/.claude-custom-scenarios.mjs` | Path to custom scenarios module |
 | `ROUTER_PORT` | From config (8082) | Override proxy port |
+| `ROUTER_LOG_DIR` | `~/.claude-custom-router.d/logs` | Directory for log files |
 
 ## API Endpoints
 
@@ -217,14 +219,14 @@ node src/custom-model-proxy.mjs --status
 
 ## Hot Reload
 
-The proxy watches `custom-models.json` for changes and reloads automatically. No restart needed.
+The proxy watches `~/.claude-custom-router.json` for changes and reloads automatically. No restart needed.
 
 ## Debug Mode
 
 Set `"debug": true` in config to enable request/response dumps:
 
 ```
-~/.claude/logs/debug/
+~/.claude-custom-router.d/logs/debug/
   └── <session-id>/
       ├── <timestamp>_<random>_<model>_req.json      # Original request
       ├── <timestamp>_<random>_<model>_processed.json # Routed request
