@@ -12,13 +12,11 @@ function createCtx(routerOverrides = {}, models = {}) {
     tokenCount: 1000,
     config: {
       Router: {
-        longContextThreshold: 60000,
-        longContext: 'long-ctx-model',
-        subagent: null,
-        background: 'bg-model',
-        webSearch: 'search-model',
-        think: 'think-model',
+        default: 'default-model',
         image: 'vision-model',
+        haiku: 'haiku-model',
+        sonnet: 'sonnet-model',
+        opus: 'opus-model',
         ...routerOverrides,
       },
       models,
@@ -72,158 +70,71 @@ describe('detectExplicitModel', () => {
   });
 });
 
-// ─── detectLongContext ────────────────────────────────────────────────────────
+// ─── detectModelFamily ────────────────────────────────────────────────────────
 
-describe('detectLongContext', () => {
-  function detectLongContext(body, ctx) {
-    const threshold = ctx.config.Router.longContextThreshold || 60000;
-    if (ctx.tokenCount > threshold && ctx.config.Router.longContext) {
-      return ctx.config.Router.longContext;
-    }
-    return null;
-  }
+describe('detectModelFamily', () => {
+  const MODEL_FAMILIES = ['opus', 'sonnet', 'haiku'];
 
-  it('should trigger when token count exceeds threshold', () => {
-    const ctx = createCtx({}, {}, 70000);
-    ctx.tokenCount = 70000;
-    assert.equal(detectLongContext({}, ctx), 'long-ctx-model');
-  });
-
-  it('should not trigger when token count is below threshold', () => {
-    const ctx = createCtx();
-    ctx.tokenCount = 50000;
-    assert.equal(detectLongContext({}, ctx), null);
-  });
-
-  it('should not trigger when no longContext model configured', () => {
-    const ctx = createCtx({ longContext: undefined });
-    ctx.tokenCount = 70000;
-    assert.equal(detectLongContext({}, ctx), null);
-  });
-
-  it('should use custom threshold from config', () => {
-    const ctx = createCtx({ longContextThreshold: 30000 });
-    ctx.tokenCount = 35000;
-    assert.equal(detectLongContext({}, ctx), 'long-ctx-model');
-  });
-});
-
-// ─── detectSubagent ───────────────────────────────────────────────────────────
-
-describe('detectSubagent', () => {
-  function detectSubagent(body, ctx) {
-    if (Array.isArray(body.system) && body.system.length > 1) {
-      const sysText = body.system[1]?.text;
-      if (sysText && sysText.startsWith('<CCR-SUBAGENT-MODEL>')) {
-        const match = sysText.match(/<CCR-SUBAGENT-MODEL>(.*?)<\/CCR-SUBAGENT-MODEL>/s);
-        if (match) {
-          body.system[1].text = sysText.replace(
-            `<CCR-SUBAGENT-MODEL>${match[1]}</CCR-SUBAGENT-MODEL>`, ''
-          );
-          return match[1];
-        }
+  function detectModelFamily(body, ctx) {
+    if (!body.model) return null;
+    const modelLower = body.model.toLowerCase();
+    for (const family of MODEL_FAMILIES) {
+      if (modelLower.includes(family) && ctx.config.Router[family]) {
+        return ctx.config.Router[family];
       }
     }
     return null;
   }
 
-  it('should detect and extract subagent model tag', () => {
-    const body = {
-      system: [
-        { type: 'text', text: 'You are helpful.' },
-        { type: 'text', text: '<CCR-SUBAGENT-MODEL>my-model</CCR-SUBAGENT-MODEL>Extra instructions' },
-      ],
-    };
-    const result = detectSubagent(body, createCtx());
-    assert.equal(result, 'my-model');
-    assert.equal(body.system[1].text, 'Extra instructions');
+  it('should map sonnet model ID to sonnet provider', () => {
+    assert.equal(
+      detectModelFamily({ model: 'claude-sonnet-4-6' }, createCtx()),
+      'sonnet-model'
+    );
   });
 
-  it('should return null when no subagent tag', () => {
-    const body = {
-      system: [
-        { type: 'text', text: 'You are helpful.' },
-        { type: 'text', text: 'No tag here' },
-      ],
-    };
-    assert.equal(detectSubagent(body, createCtx()), null);
+  it('should map haiku model ID to haiku provider', () => {
+    assert.equal(
+      detectModelFamily({ model: 'claude-haiku-4-5' }, createCtx()),
+      'haiku-model'
+    );
   });
 
-  it('should return null when system is a string', () => {
-    assert.equal(detectSubagent({ system: 'simple string' }, createCtx()), null);
+  it('should map opus model ID to opus provider', () => {
+    assert.equal(
+      detectModelFamily({ model: 'claude-opus-4-6' }, createCtx()),
+      'opus-model'
+    );
   });
 
-  it('should return null when system has only one element', () => {
-    const body = {
-      system: [{ type: 'text', text: 'Only one' }],
-    };
-    assert.equal(detectSubagent(body, createCtx()), null);
-  });
-});
-
-// ─── detectBackground ─────────────────────────────────────────────────────────
-
-describe('detectBackground', () => {
-  function detectBackground(body, ctx) {
-    if (body.model && body.model.includes('claude') && body.model.includes('haiku')) {
-      if (ctx.config.Router.background) return ctx.config.Router.background;
-    }
-    return null;
-  }
-
-  it('should detect haiku model requests', () => {
-    assert.equal(detectBackground({ model: 'claude-haiku-4-5' }, createCtx()), 'bg-model');
+  it('should return null for unknown model IDs', () => {
+    assert.equal(
+      detectModelFamily({ model: 'claude-unknown-model' }, createCtx()),
+      null
+    );
   });
 
-  it('should not detect non-haiku models', () => {
-    assert.equal(detectBackground({ model: 'claude-sonnet-4-6' }, createCtx()), null);
+  it('should return null when no model family configured', () => {
+    const ctx = createCtx({ haiku: undefined, sonnet: undefined, opus: undefined });
+    assert.equal(
+      detectModelFamily({ model: 'claude-sonnet-4-6' }, ctx),
+      null
+    );
   });
 
-  it('should return null when no background model configured', () => {
-    const ctx = createCtx({ background: undefined });
-    assert.equal(detectBackground({ model: 'claude-haiku-4-5' }, ctx), null);
-  });
-});
-
-// ─── detectWebSearch ──────────────────────────────────────────────────────────
-
-describe('detectWebSearch', () => {
-  function detectWebSearch(body, ctx) {
-    if (Array.isArray(body.tools) && body.tools.some(t => t.type?.startsWith('web_search'))) {
-      if (ctx.config.Router.webSearch) return ctx.config.Router.webSearch;
-    }
-    return null;
-  }
-
-  it('should detect web_search tools', () => {
-    const body = { tools: [{ type: 'web_search_xxx' }] };
-    assert.equal(detectWebSearch(body, createCtx()), 'search-model');
+  it('should return null when body.model is undefined', () => {
+    assert.equal(detectModelFamily({}, createCtx()), null);
   });
 
-  it('should not detect non-web-search tools', () => {
-    const body = { tools: [{ type: 'text_editor' }] };
-    assert.equal(detectWebSearch(body, createCtx()), null);
+  it('should return null when body.model is empty string', () => {
+    assert.equal(detectModelFamily({ model: '' }, createCtx()), null);
   });
 
-  it('should return null when no tools', () => {
-    assert.equal(detectWebSearch({}, createCtx()), null);
-  });
-});
-
-// ─── detectThink ──────────────────────────────────────────────────────────────
-
-describe('detectThink', () => {
-  function detectThink(body, ctx) {
-    if (body.thinking && ctx.config.Router.think) return ctx.config.Router.think;
-    return null;
-  }
-
-  it('should detect thinking requests', () => {
-    assert.equal(detectThink({ thinking: { budget_tokens: 10000 } }, createCtx()), 'think-model');
-  });
-
-  it('should return null when no thinking field', () => {
-    assert.equal(detectThink({}, createCtx()), null);
+  it('should prefer opus over sonnet when model ID contains both', () => {
+    assert.equal(
+      detectModelFamily({ model: 'claude-opus-sonnet-4-6' }, createCtx()),
+      'opus-model'
+    );
   });
 });
 

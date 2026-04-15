@@ -128,14 +128,11 @@ const L = {
 
 /**
  * @typedef {Object} RouterConfig
- * @property {string} [default] - Default model ID
- * @property {string} [longContext] - Model for long context scenarios
- * @property {number} [longContextThreshold=60000] - Token threshold for long context
- * @property {string} [subagent] - Model for subagent scenarios
- * @property {string} [background] - Model for background tasks
- * @property {string} [webSearch] - Model for web search scenarios
- * @property {string} [think] - Model for extended thinking
+ * @property {string} [default] - Default model ID (fallback when no other match)
  * @property {string} [image] - Model for image/vision scenarios
+ * @property {string} [haiku] - Model for Haiku family requests
+ * @property {string} [sonnet] - Model for Sonnet family requests
+ * @property {string} [opus] - Model for Opus family requests
  */
 
 /**
@@ -292,74 +289,23 @@ function detectExplicitModel(body, ctx) {
 }
 
 /**
- * Detects long context scenarios based on estimated token count.
- * Routes to a model with larger context window when threshold is exceeded.
+ * Model families detected from Claude model IDs, ordered by specificity.
+ * Opus checked first to avoid "sonnet" matching inside compound names.
  */
-function detectLongContext(body, ctx) {
-  const threshold = ctx.config.Router.longContextThreshold || 60000;
-  if (ctx.tokenCount > threshold && ctx.config.Router.longContext) {
-    L.route(`longContext: tokens=${ctx.tokenCount} > threshold=${threshold}`);
-    return ctx.config.Router.longContext;
-  }
-  return null;
-}
+const MODEL_FAMILIES = ['opus', 'sonnet', 'haiku'];
 
 /**
- * Detects subagent model overrides embedded in system prompts.
- * Looks for <CCR-SUBAGENT-MODEL>model-id</CCR-SUBAGENT-MODEL> tags
- * and strips them from the request before routing.
+ * Detects model family from the Claude model ID in the request.
+ * Maps body.model (e.g., "claude-sonnet-4-6") to Router.haiku/sonnet/opus config.
  */
-function detectSubagent(body, ctx) {
-  if (Array.isArray(body.system) && body.system.length > 1) {
-    const sysText = body.system[1]?.text;
-    if (sysText && sysText.startsWith('<CCR-SUBAGENT-MODEL>')) {
-      const match = sysText.match(/<CCR-SUBAGENT-MODEL>(.*?)<\/CCR-SUBAGENT-MODEL>/s);
-      if (match) {
-        body.system[1].text = sysText.replace(
-          `<CCR-SUBAGENT-MODEL>${match[1]}</CCR-SUBAGENT-MODEL>`, ''
-        );
-        L.route(`subagent: model=${match[1]}`);
-        return match[1];
-      }
+function detectModelFamily(body, ctx) {
+  if (!body.model) return null;
+  const modelLower = body.model.toLowerCase();
+  for (const family of MODEL_FAMILIES) {
+    if (modelLower.includes(family) && ctx.config.Router[family]) {
+      L.route(`modelFamily: ${body.model} -> ${family}`);
+      return ctx.config.Router[family];
     }
-  }
-  return null;
-}
-
-/**
- * Detects background tasks by identifying Haiku model requests.
- * These are typically lightweight, non-interactive agent tasks.
- */
-function detectBackground(body, ctx) {
-  if (body.model && body.model.includes('claude') && body.model.includes('haiku')) {
-    if (ctx.config.Router.background) {
-      L.route(`background: ${body.model}`);
-      return ctx.config.Router.background;
-    }
-  }
-  return null;
-}
-
-/**
- * Detects web search scenarios by checking for web_search tool types.
- */
-function detectWebSearch(body, ctx) {
-  if (Array.isArray(body.tools) && body.tools.some(t => t.type?.startsWith('web_search'))) {
-    if (ctx.config.Router.webSearch) {
-      L.route('webSearch: detected');
-      return ctx.config.Router.webSearch;
-    }
-  }
-  return null;
-}
-
-/**
- * Detects extended thinking requests and routes to a capable model.
- */
-function detectThink(body, ctx) {
-  if (body.thinking && ctx.config.Router.think) {
-    L.route(`think: ${JSON.stringify(body.thinking)}`);
-    return ctx.config.Router.think;
   }
   return null;
 }
@@ -389,13 +335,9 @@ function detectImage(body, ctx) {
 
 /** @type {ScenarioDetector[]} */
 const builtinDetectors = [
-  { name: 'explicit',    priority: 0,  detect: detectExplicitModel },
-  { name: 'image',       priority: 5,  detect: detectImage },
-  { name: 'longContext', priority: 10, detect: detectLongContext },
-  { name: 'subagent',    priority: 20, detect: detectSubagent },
-  { name: 'background',  priority: 30, detect: detectBackground },
-  { name: 'webSearch',   priority: 40, detect: detectWebSearch },
-  { name: 'think',       priority: 50, detect: detectThink },
+  { name: 'explicit',    priority: 0, detect: detectExplicitModel },
+  { name: 'image',       priority: 5, detect: detectImage },
+  { name: 'modelFamily', priority: 8, detect: detectModelFamily },
 ];
 
 /** @type {ScenarioDetector[]} */

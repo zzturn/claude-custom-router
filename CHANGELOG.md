@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] - 2025-04-15
+
+### Changed
+
+- **Breaking**: Replaced scenario detectors with model family mapping
+  - Removed: longContext, subagent, background, webSearch, think detectors
+  - Added: `modelFamily` detector — maps Claude model IDs (haiku/sonnet/opus) to Router config
+  - Image detection remains with higher priority than model family mapping
+- Config format: `Router.haiku`, `Router.sonnet`, `Router.opus` replace old scenario keys
+  - Removed: `longContext`, `longContextThreshold`, `subagent`, `background`, `webSearch`, `think`
+
+### Migration
+
+Update `~/.claude-custom-router.json`:
+
+```json
+// Old format
+{
+  "Router": {
+    "default": "...",
+    "longContext": "...",
+    "background": "...",
+    "think": "...",
+    "webSearch": "..."
+  }
+}
+
+// New format
+{
+  "Router": {
+    "default": "...",
+    "image": "...",
+    "haiku": "...",
+    "sonnet": "...",
+    "opus": "..."
+  }
+}
+```
+
 ## [1.0.0] - 2025-04-15
 
 ### Added

@@ -1,15 +1,14 @@
 # Claude Custom Router
 
-A lightweight, zero-dependency proxy that routes [Claude Code](https://docs.anthropic.com/en/docs/claude-code) API requests to different LLM providers based on scenario detection.
+A lightweight, zero-dependency proxy that routes [Claude Code](https://docs.anthropic.com/en/docs/claude-code) API requests to different LLM providers based on model ID mapping and scenario detection.
 
 ## Why?
 
 Claude Code sends all requests to a single Anthropic API endpoint. If you want to:
 
-- Use **cheaper models** for background tasks while keeping Claude for complex work
+- **Route different model families** (Haiku/Sonnet/Opus) to different providers
 - Route **image requests** to a vision-capable model
-- Handle **long contexts** with a model that has a larger window
-- Use **extended thinking** with a reasoning-specialized model
+- Use a **default provider** as fallback
 
 ...you'd need to manually switch models or maintain separate configurations. This proxy automates it.
 
@@ -19,19 +18,17 @@ Claude Code sends all requests to a single Anthropic API endpoint. If you want t
 ┌─────────────┐     ┌──────────────────────┐     ┌─────────────────┐
 │ Claude Code  │────▶│  Custom Model Proxy   │────▶│  Claude API     │
 │              │     │                      │     ├─────────────────┤
-│              │     │  Scenario Detection: │     │  GLM / DeepSeek │
+│              │     │  Routing:            │     │  GLM / DeepSeek │
 │              │     │  • Explicit override  │     │  Qwen / Others  │
 │              │     │  • Image detection    │     │  ...            │
-│              │     │  • Long context       │     └─────────────────┘
-│              │     │  • Subagent tags      │
-│              │     │  • Background tasks   │◀── Custom scenarios
-│              │     │  • Web search tools   │    (extensible)
-│              │     │  • Extended thinking  │
-│              │     └──────────────────────┘
+│              │     │  • Model ID mapping   │     └─────────────────┘
+│              │     │    (haiku/sonnet/opus)│
+│              │     │                      │◀── Custom scenarios
+│              │     └──────────────────────┘    (extensible)
 └─────────────┘
 ```
 
-Each request goes through a chain of **scenario detectors** (sorted by priority). The first match determines which model handles the request.
+Each request goes through a chain of **detectors** (sorted by priority). The first match determines which model handles the request.
 
 ## Quick Start
 
@@ -78,20 +75,38 @@ Config file: `~/.claude-custom-router.json` (or `$ROUTER_CONFIG_PATH`)
   "port": 8082,
   "debug": false,
   "Router": {
-    "default": "my-main-model",
-    "longContext": "model-with-large-context",
-    "longContextThreshold": 60000,
+    "default": "my-default-model",
     "image": "vision-model",
-    "background": "fast-cheap-model",
-    "think": "reasoning-model",
-    "webSearch": "search-capable-model"
+    "haiku": "haiku-provider",
+    "sonnet": "sonnet-provider",
+    "opus": "opus-provider"
   },
   "models": {
-    "my-main-model": {
+    "my-default-model": {
       "name": "actual-model-name",
       "baseURL": "https://api.provider.com/v1",
       "apiKey": "${MY_API_KEY}",
       "maxTokens": 8192
+    },
+    "haiku-provider": {
+      "name": "haiku-model-name",
+      "baseURL": "https://api.haiku-provider.com/v1",
+      "apiKey": "${HAIKU_API_KEY}"
+    },
+    "sonnet-provider": {
+      "name": "sonnet-model-name",
+      "baseURL": "https://api.sonnet-provider.com/v1",
+      "apiKey": "${SONNET_API_KEY}"
+    },
+    "opus-provider": {
+      "name": "opus-model-name",
+      "baseURL": "https://api.opus-provider.com/v1",
+      "apiKey": "${OPUS_API_KEY}"
+    },
+    "vision-model": {
+      "name": "vision-model-name",
+      "baseURL": "https://api.provider.com/v1",
+      "apiKey": "${API_KEY}"
     }
   }
 }
@@ -119,14 +134,13 @@ Use `${ENV_VAR}` or `$ENV_VAR` syntax to reference environment variables:
 
 ### Router Rules
 
-| Scenario | Key | Description |
-|----------|-----|-------------|
+| Rule | Key | Description |
+|------|-----|-------------|
 | Default | `default` | Fallback when no detector matches |
-| Long Context | `longContext` + `longContextThreshold` | Routes when estimated tokens exceed threshold |
 | Image | `image` | Routes requests containing image content |
-| Background | `background` | Routes Haiku model requests (lightweight tasks) |
-| Extended Thinking | `think` | Routes requests with `thinking` parameter |
-| Web Search | `webSearch` | Routes requests with `web_search` tools |
+| Haiku | `haiku` | Routes when model ID contains "haiku" |
+| Sonnet | `sonnet` | Routes when model ID contains "sonnet" |
+| Opus | `opus` | Routes when model ID contains "opus" |
 
 ## Scenario Detectors
 
@@ -136,21 +150,11 @@ Built-in detectors run in priority order (lower = higher priority):
 |----------|----------|---------|
 | 0 | **explicit** | Comma-separated model ID in request (`model: "original,custom-model"`) |
 | 5 | **image** | Image or image_url content in recent messages |
-| 10 | **longContext** | Estimated tokens > threshold (default: 60k) |
-| 20 | **subagent** | `<CCR-SUBAGENT-MODEL>` tag in system prompt |
-| 30 | **background** | Haiku model detected in request |
-| 40 | **webSearch** | `web_search` tool type present |
-| 50 | **think** | `thinking` parameter present |
+| 8 | **modelFamily** | Model ID contains haiku/sonnet/opus keyword |
 
-### Subagent Model Override
-
-Embed a model tag in your subagent's system prompt to route it to a specific model:
-
-```
-<CCR-SUBAGENT-MODEL>my-custom-model</CCR-SUBAGENT-MODEL>You are a helpful assistant...
-```
-
-The proxy strips the tag and routes to the specified model.
+After all detectors, the router tries:
+1. **Direct lookup**: `body.model` as a key in `models` config
+2. **Default fallback**: `Router.default`
 
 ## Custom Scenarios
 

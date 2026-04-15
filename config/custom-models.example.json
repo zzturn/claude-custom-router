@@ -3,12 +3,10 @@
   "debug": false,
   "Router": {
     "default": "my-default-model",
-    "longContext": "model-with-large-context",
-    "longContextThreshold": 60000,
     "image": "vision-model",
-    "background": "fast-cheap-model",
-    "think": "reasoning-model",
-    "webSearch": "search-capable-model"
+    "haiku": "haiku-provider",
+    "sonnet": "sonnet-provider",
+    "opus": "opus-provider"
   },
   "models": {
     "my-default-model": {
@@ -17,29 +15,23 @@
       "apiKey": "${YOUR_API_KEY_ENV_VAR}",
       "maxTokens": 8192
     },
-    "model-with-large-context": {
-      "name": "long-context-model",
+    "haiku-provider": {
+      "name": "haiku-model-name",
       "baseURL": "https://api.provider.com/v1",
-      "apiKey": "${YOUR_API_KEY_ENV_VAR}",
-      "maxTokens": 16384
+      "apiKey": "${YOUR_API_KEY_ENV_VAR}"
+    },
+    "sonnet-provider": {
+      "name": "sonnet-model-name",
+      "baseURL": "https://api.provider.com/v1",
+      "apiKey": "${YOUR_API_KEY_ENV_VAR}"
+    },
+    "opus-provider": {
+      "name": "opus-model-name",
+      "baseURL": "https://api.provider.com/v1",
+      "apiKey": "${YOUR_API_KEY_ENV_VAR}"
     },
     "vision-model": {
       "name": "vision-model-name",
-      "baseURL": "https://api.provider.com/v1",
-      "apiKey": "${YOUR_API_KEY_ENV_VAR}"
-    },
-    "fast-cheap-model": {
-      "name": "fast-model",
-      "baseURL": "https://api.provider.com/v1",
-      "apiKey": "${YOUR_API_KEY_ENV_VAR}"
-    },
-    "reasoning-model": {
-      "name": "reasoning-model-name",
-      "baseURL": "https://api.provider.com/v1",
-      "apiKey": "${YOUR_API_KEY_ENV_VAR}"
-    },
-    "search-capable-model": {
-      "name": "search-model-name",
       "baseURL": "https://api.provider.com/v1",
       "apiKey": "${YOUR_API_KEY_ENV_VAR}"
     }

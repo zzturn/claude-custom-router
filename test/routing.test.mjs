@@ -19,11 +19,10 @@ const TEST_CONFIG = {
   debug: false,
   Router: {
     default: 'test-model',
-    background: 'test-model',
-    think: 'test-model',
-    longContext: 'test-model',
     image: 'test-model',
-    webSearch: 'test-model',
+    haiku: 'test-model',
+    sonnet: 'test-model',
+    opus: 'test-model',
   },
   models: {
     'test-model': {
