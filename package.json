@@ -1,0 +1,35 @@
+{
+  "name": "claude-custom-router",
+  "version": "1.0.0",
+  "description": "A lightweight proxy that routes Claude Code API requests to different LLM providers based on scenario detection",
+  "type": "module",
+  "main": "src/custom-model-proxy.mjs",
+  "bin": {
+    "claude-router": "./src/custom-model-proxy.mjs"
+  },
+  "scripts": {
+    "start": "node src/custom-model-proxy.mjs",
+    "stop": "node src/custom-model-proxy.mjs --stop",
+    "status": "node src/custom-model-proxy.mjs --status",
+    "test": "node --test test/*.test.mjs"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "proxy",
+    "router",
+    "llm",
+    "anthropic",
+    "multi-model"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "src/",
+    "config/",
+    "examples/"
+  ]
+}

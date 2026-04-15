@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+
+# Config (users create their own)
+config/custom-models.json
+
+# Runtime
+*.pid
+logs/
+
+# Environment
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Debug
+debug/
