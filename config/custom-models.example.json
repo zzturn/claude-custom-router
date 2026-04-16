@@ -5,8 +5,18 @@
     "default": "my-default-model",
     "image": "vision-model",
     "haiku": "haiku-provider",
-    "sonnet": "sonnet-provider",
+    "sonnet": {
+      "strategy": "priority-fallback",
+      "providers": [
+        { "id": "deepseek-sonnet", "maxConns": 5 },
+        { "id": "qwen-sonnet",     "maxConns": 3 },
+        { "id": "glm-sonnet",      "maxConns": 3 }
+      ]
+    },
     "opus": "opus-provider"
+  },
+  "LoadBalancer": {
+    "showProvider": true
   },
   "models": {
     "my-default-model": {
@@ -20,10 +30,20 @@
       "baseURL": "https://api.provider.com/v1",
       "apiKey": "${YOUR_API_KEY_ENV_VAR}"
     },
-    "sonnet-provider": {
-      "name": "sonnet-model-name",
-      "baseURL": "https://api.provider.com/v1",
-      "apiKey": "${YOUR_API_KEY_ENV_VAR}"
+    "deepseek-sonnet": {
+      "name": "deepseek-chat",
+      "baseURL": "https://api.deepseek.com/anthropic",
+      "apiKey": "${DEEPSEEK_API_KEY}"
+    },
+    "qwen-sonnet": {
+      "name": "qwen-plus",
+      "baseURL": "https://dashscope.aliyuncs.com/apps/anthropic",
+      "apiKey": "${QWEN_API_KEY}"
+    },
+    "glm-sonnet": {
+      "name": "glm-4",
+      "baseURL": "https://open.bigmodel.cn/api/anthropic",
+      "apiKey": "${GLM_API_KEY}"
     },
     "opus-provider": {
       "name": "opus-model-name",

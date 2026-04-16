@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - 2025-04-16
+
+### Added
+
+- **Load Balancing**: Distribute requests across multiple providers to avoid rate limiting
+  - `priority-fallback` strategy: check providers in order, select first with available capacity
+  - Active connection tracking via stream lifecycle events (`close` / `error`)
+  - Once-guard prevents double-decrement on connection cleanup
+  - Fail-open behavior: uses first provider when all at capacity
+  - Extensible strategy pattern for future strategies (round-robin, weighted, etc.)
+- **Visibility**: Know which provider handled each request
+  - `X-Router-Provider` response header
+  - SSE comment injection (`: router_provider: <id>`) for streaming responses
+  - `[ROUTE]` log entries with active connection counts
+  - `/health` endpoint includes LB group status
+  - Configurable via `LoadBalancer.showProvider`
+- **Config validation**: Strict validation for LB groups on startup and hot-reload
+  - Provider IDs must exist in models config
+  - No duplicate providers within a group
+  - `maxConns` must be positive integers
+  - Strategy must be recognized
+  - Model config IDs cannot collide with Router keys
+
+### Changed
+
+- **Detector contract change**: Built-in detectors now return Router **keys** (e.g., `"sonnet"`) instead of Router **values** (e.g., `"sonnet-model"`)
+  - `detectModelFamily()` returns `"sonnet"` / `"haiku"` / `"opus"` instead of the mapped provider
+  - `detectImage()` returns `"image"` instead of the mapped vision provider
+  - `resolveModel()` default fallback returns `"default"` instead of the mapped default
+  - Disambiguation handled by new `resolveRouterEntry()` in `routeAndForward()`
+- Custom detectors returning model config IDs still work via fallback, but returning Router keys is recommended
+
 ## [2.0.0] - 2025-04-15
 
 ### Changed

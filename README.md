@@ -8,6 +8,7 @@ Claude Code sends all requests to a single Anthropic API endpoint. If you want t
 
 - **Route different model families** (Haiku/Sonnet/Opus) to different providers
 - Route **image requests** to a vision-capable model
+- **Load balance** across multiple providers to avoid rate limiting
 - Use a **default provider** as fallback
 
 ...you'd need to manually switch models or maintain separate configurations. This proxy automates it.
@@ -112,6 +113,71 @@ Config file: `~/.claude-custom-router.json` (or `$ROUTER_CONFIG_PATH`)
 }
 ```
 
+### Router values: string vs object
+
+Each Router value can be either:
+
+- **String** (single provider): `"sonnet": "sonnet-provider"` — routes all matching requests to one provider
+- **Object** (load balanced group): see [Load Balancing](#load-balancing) below
+
+## Load Balancing
+
+When running Claude Code agent teams, multiple agents make concurrent LLM API calls that can overwhelm a single provider. Load balancing distributes requests across multiple providers based on **active connection counts**.
+
+### Priority Fallback Strategy
+
+The default strategy checks providers in configured order and selects the first one with available capacity (`activeConns < maxConns`). This is ideal when you have a primary provider and 1-2 backups — the primary handles most traffic, and backups only activate when the primary is saturated.
+
+### Configuration
+
+```json
+{
+  "Router": {
+    "sonnet": {
+      "strategy": "priority-fallback",
+      "providers": [
+        { "id": "deepseek-sonnet", "maxConns": 5 },
+        { "id": "qwen-sonnet",     "maxConns": 3 },
+        { "id": "glm-sonnet",      "maxConns": 3 }
+      ]
+    }
+  },
+  "LoadBalancer": {
+    "showProvider": true
+  },
+  "models": {
+    "deepseek-sonnet": { "name": "deepseek-chat", "baseURL": "...", "apiKey": "..." },
+    "qwen-sonnet":     { "name": "qwen-plus",     "baseURL": "...", "apiKey": "..." },
+    "glm-sonnet":      { "name": "glm-4",         "baseURL": "...", "apiKey": "..." }
+  }
+}
+```
+
+### How it works
+
+1. When a request matches the `sonnet` Router key, the proxy checks providers in order
+2. It selects the first provider where `activeConnections < maxConns`
+3. If all providers are at capacity, it **fail-opens** to the first provider (no request dropped)
+4. Active connections are tracked via stream lifecycle events (`close` / `error`)
+5. Connection cleanup uses an **once-guard** to prevent double-decrement
+
+### Visibility
+
+When `LoadBalancer.showProvider` is `true`:
+- **Response header**: `X-Router-Provider: deepseek-sonnet`
+- **SSE comment**: `: router_provider: deepseek-sonnet` (in streaming responses)
+- **Logs**: `[ROUTE] sonnet: deepseek-sonnet [active: 2/5]`
+- **Health endpoint**: `/health` includes LB group status with active connection counts
+
+### Config Validation
+
+The proxy validates LB config at startup and on hot-reload:
+- All provider IDs must reference existing model configs
+- Provider IDs must be unique within a group
+- `maxConns` must be positive integers
+- Strategy must be known (`priority-fallback`)
+- Model config IDs cannot collide with Router keys
+
 ### Model Configuration
 
 | Field | Required | Description |
@@ -172,7 +238,8 @@ export const detectors = [
       const hasCodeTools = (body.tools || []).some(t =>
         t.name === 'Read' || t.name === 'Edit'
       );
-      return hasCodeTools ? ctx.config.Router.coding : null;
+      // Return Router KEY, not model config ID
+      return hasCodeTools ? 'coding' : null;
     },
   },
 ];
@@ -187,6 +254,8 @@ Then add the router rule:
   }
 }
 ```
+
+> **Note**: Custom detectors should return the **Router key** (e.g., `'coding'`), not the model config ID. The proxy resolves the key to either a string provider or a LB group object. Detectors returning model config IDs still work via fallback, but returning the Router key is the recommended approach.
 
 See [`examples/custom-scenarios.mjs`](examples/custom-scenarios.mjs) for more examples.
 
@@ -216,7 +285,7 @@ node src/custom-model-proxy.mjs --status
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/health` | GET | Health check (returns models, router config, debug status) |
+| `/health` | GET | Health check (returns models, router config, LB status, debug status) |
 | `/v1/models` | GET | List configured models (Anthropic API format) |
 | `/v1/messages` | POST | Proxy endpoint (routes to appropriate model) |
 | Other paths | Any | Forwarded to default model's base URL |

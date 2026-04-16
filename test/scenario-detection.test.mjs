@@ -80,30 +80,30 @@ describe('detectModelFamily', () => {
     const modelLower = body.model.toLowerCase();
     for (const family of MODEL_FAMILIES) {
       if (modelLower.includes(family) && ctx.config.Router[family]) {
-        return ctx.config.Router[family];
+        return family;
       }
     }
     return null;
   }
 
-  it('should map sonnet model ID to sonnet provider', () => {
+  it('should map sonnet model ID to sonnet key', () => {
     assert.equal(
       detectModelFamily({ model: 'claude-sonnet-4-6' }, createCtx()),
-      'sonnet-model'
+      'sonnet'
     );
   });
 
-  it('should map haiku model ID to haiku provider', () => {
+  it('should map haiku model ID to haiku key', () => {
     assert.equal(
       detectModelFamily({ model: 'claude-haiku-4-5' }, createCtx()),
-      'haiku-model'
+      'haiku'
     );
   });
 
-  it('should map opus model ID to opus provider', () => {
+  it('should map opus model ID to opus key', () => {
     assert.equal(
       detectModelFamily({ model: 'claude-opus-4-6' }, createCtx()),
-      'opus-model'
+      'opus'
     );
   });
 
@@ -133,7 +133,7 @@ describe('detectModelFamily', () => {
   it('should prefer opus over sonnet when model ID contains both', () => {
     assert.equal(
       detectModelFamily({ model: 'claude-opus-sonnet-4-6' }, createCtx()),
-      'opus-model'
+      'opus'
     );
   });
 });
@@ -151,7 +151,7 @@ describe('detectImage', () => {
       if (Array.isArray(msg.content)) {
         for (const part of msg.content) {
           if (part.type === 'image' || part.type === 'image_url') {
-            return ctx.config.Router.image;
+            return 'image';
           }
         }
       }
@@ -167,7 +167,7 @@ describe('detectImage', () => {
         { role: 'user', content: [{ type: 'image', source: {} }] },
       ],
     };
-    assert.equal(detectImage(body, createCtx()), 'vision-model');
+    assert.equal(detectImage(body, createCtx()), 'image');
   });
 
   it('should detect image_url type', () => {
@@ -176,7 +176,7 @@ describe('detectImage', () => {
         { role: 'user', content: [{ type: 'image_url', url: 'https://example.com/img.png' }] },
       ],
     };
-    assert.equal(detectImage(body, createCtx()), 'vision-model');
+    assert.equal(detectImage(body, createCtx()), 'image');
   });
 
   it('should return null for text-only messages', () => {
