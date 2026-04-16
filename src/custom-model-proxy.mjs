@@ -120,10 +120,9 @@ function log(level, msg) {
   try { writeFile(LOG_PATH, line + '\n', { flag: 'a' }, (e) => { if (e) console.error('Log write failed:', e.message); }); } catch (e) { console.error('Log write failed:', e.message); }
 }
 
-/** @type {{ info: (msg: string) => void, route: (msg: string) => void, warn: (msg: string) => void, error: (msg: string) => void, debug: (msg: string) => void }} */
+/** @type {{ info: (msg: string) => void, warn: (msg: string) => void, error: (msg: string) => void, debug: (msg: string) => void }} */
 const L = {
   info:  (msg) => log('INFO',  msg),
-  route: (msg) => log('ROUTE', msg),
   warn:  (msg) => log('WARN',  msg),
   error: (msg) => log('ERROR', msg),
   debug: (msg) => { if (config.debug) log('DEBUG', msg); },
@@ -376,12 +375,12 @@ function estimateTokenCount(body) {
 /** Wrappers that add logging around imported detectors */
 const detectModelFamilyLogged = (body, ctx) => {
   const result = detectModelFamily(body, ctx);
-  if (result) L.route(`modelFamily: ${body.model} -> ${result}`);
+  if (result) L.debug(`modelFamily: ${body.model} -> ${result}`);
   return result;
 };
 const detectImageLogged = (body, ctx) => {
   const result = detectImage(body, ctx);
-  if (result) L.route(`image: detected in messages`);
+  if (result) L.debug(`image: detected in messages`);
   return result;
 };
 
@@ -432,19 +431,19 @@ function resolveModel(body, tokenCount) {
   for (const detector of allDetectors) {
     const modelId = detector.detect(body, ctx);
     if (modelId) {
-      L.route(`${detector.name} -> ${modelId}`);
+      L.debug(`${detector.name} -> ${modelId}`);
       return modelId;
     }
   }
 
   if (body.model && ctx.config.models[body.model]) {
-    L.route(`direct -> ${body.model}`);
+    L.debug(`direct -> ${body.model}`);
     return body.model;
   }
 
   const defaultModel = config.Router.default;
   if (defaultModel) {
-    L.route(`default -> default`);
+    L.debug(`default -> default`);
     return 'default';
   }
 
@@ -789,11 +788,6 @@ function routeAndForward(pathname, reqHeaders, rawBody, res) {
   // Connection tracking
   const tracker = withConnTracking(providerId);
 
-  // Log routing decision
-  if (groupKey) {
-    L.route(`${groupKey}: ${providerId} [active: ${getConns(providerId)}/${routing.entry?.providers?.find(p => p.id === providerId)?.maxConns || '?'}]`);
-  }
-
   const target = modelConf.baseURL.replace(/\/+$/, '') + pathname;
   const actualModel = modelConf.name || providerId;
   const originalModel = parsed.model;
@@ -807,11 +801,13 @@ function routeAndForward(pathname, reqHeaders, rawBody, res) {
       : {}),
   };
 
-  if (originalModel !== actualModel) {
-    L.info(`Model: ${originalModel} -> ${actualModel}`);
-  }
+  // Consolidated routing log — one line per request
+  const maxConns = groupKey ? (routing.entry?.providers?.find(p => p.id === providerId)?.maxConns || '?') : null;
+  const lbInfo = groupKey ? ` [${groupKey} ${getConns(providerId)}/${maxConns} active]` : '';
+  L.info(`${originalModel} -> ${actualModel}${lbInfo}`);
+  L.debug(`-> ${target}`);
   if (modelConf.maxTokens && parsed.max_tokens && parsed.max_tokens > modelConf.maxTokens) {
-    L.info(`max_tokens: ${parsed.max_tokens} -> ${modelConf.maxTokens}`);
+    L.info(`  max_tokens: ${parsed.max_tokens} -> ${modelConf.maxTokens}`);
   }
 
   const bodyBuf = Buffer.from(JSON.stringify(forwarded));
@@ -825,8 +821,6 @@ function routeAndForward(pathname, reqHeaders, rawBody, res) {
     fwdHeaders['x-api-key'] = modelConf.apiKey;
     fwdHeaders['authorization'] = `Bearer ${modelConf.apiKey}`;
   }
-
-  L.info(`-> ${target} (model: ${actualModel})`);
 
   // Debug dump
   const tag = config.debug ? debugFileTag(actualModel) : null;
