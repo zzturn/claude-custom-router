@@ -1,17 +1,14 @@
 import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 
+import {
+  strategies, activeConns, getConns, withConnTracking,
+} from '../src/load-balancer.mjs';
+
 // ─── Strategy Tests ────────────────────────────────────────────────────────
 
 describe('priority-fallback strategy', () => {
-  const priorityFallback = (providers, ctx) => {
-    if (!providers || providers.length === 0) return null;
-    for (const p of providers) {
-      if (ctx.getConns(p.id) < p.maxConns) return p.id;
-    }
-    return providers[0].id;
-  };
-
+  const priorityFallback = strategies['priority-fallback'];
   const makeCtx = (connsMap) => ({ getConns: (id) => connsMap[id] || 0 });
 
   it('should select first provider with available capacity', () => {
@@ -77,22 +74,6 @@ describe('priority-fallback strategy', () => {
 // ─── Connection Tracking Tests ─────────────────────────────────────────────
 
 describe('withConnTracking', () => {
-  // Inline the connection tracking logic for isolated testing
-  const activeConns = new Map();
-
-  function incConn(id) { activeConns.set(id, (activeConns.get(id) || 0) + 1); }
-  function decConn(id) { activeConns.set(id, Math.max(0, (activeConns.get(id) || 0) - 1)); }
-  function getConns(id) { return activeConns.get(id) || 0; }
-
-  function withConnTracking(providerId) {
-    incConn(providerId);
-    let cleaned = false;
-    return {
-      cleanup: () => { if (!cleaned) { cleaned = true; decConn(providerId); } },
-      providerId,
-    };
-  }
-
   beforeEach(() => { activeConns.clear(); });
 
   it('should increment connection count on creation', () => {
@@ -130,73 +111,6 @@ describe('withConnTracking', () => {
   });
 });
 
-// ─── resolveRouterEntry Tests ──────────────────────────────────────────────
-
-describe('resolveRouterEntry', () => {
-  let config;
-
-  function resolveRouterEntry(resolvedKey) {
-    const entry = config.Router[resolvedKey];
-    if (entry !== undefined) return { type: 'router', key: resolvedKey, entry };
-    if (config.models[resolvedKey]) return { type: 'direct', modelConf: config.models[resolvedKey], id: resolvedKey };
-    return null;
-  }
-
-  beforeEach(() => {
-    config = {
-      Router: {
-        default: 'glm-default',
-        sonnet: {
-          strategy: 'priority-fallback',
-          providers: [
-            { id: 'deepseek-sonnet', maxConns: 5 },
-            { id: 'qwen-sonnet', maxConns: 3 },
-          ],
-        },
-      },
-      models: {
-        'glm-default': { name: 'glm-4', baseURL: 'https://glm.api', apiKey: 'k' },
-        'deepseek-sonnet': { name: 'deepseek-chat', baseURL: 'https://ds.api', apiKey: 'k' },
-        'qwen-sonnet': { name: 'qwen-plus', baseURL: 'https://qw.api', apiKey: 'k' },
-      },
-    };
-  });
-
-  it('should resolve Router key with string value', () => {
-    const result = resolveRouterEntry('default');
-    assert.equal(result.type, 'router');
-    assert.equal(result.key, 'default');
-    assert.equal(result.entry, 'glm-default');
-  });
-
-  it('should resolve Router key with object value (LB group)', () => {
-    const result = resolveRouterEntry('sonnet');
-    assert.equal(result.type, 'router');
-    assert.equal(result.key, 'sonnet');
-    assert.equal(typeof result.entry, 'object');
-    assert.equal(result.entry.strategy, 'priority-fallback');
-  });
-
-  it('should resolve direct model config ID', () => {
-    const result = resolveRouterEntry('deepseek-sonnet');
-    assert.equal(result.type, 'direct');
-    assert.equal(result.id, 'deepseek-sonnet');
-    assert.equal(result.modelConf.name, 'deepseek-chat');
-  });
-
-  it('should return null for unknown key', () => {
-    assert.equal(resolveRouterEntry('nonexistent'), null);
-  });
-
-  it('should prefer Router entry over model config when both exist', () => {
-    // If 'glm-default' were also a Router key, Router should win
-    config.Router['glm-default'] = 'some-other';
-    const result = resolveRouterEntry('glm-default');
-    assert.equal(result.type, 'router');
-    assert.equal(result.entry, 'some-other');
-  });
-});
-
 // ─── Config Validation Tests ───────────────────────────────────────────────
 
 describe('LB config validation', () => {
@@ -204,6 +118,7 @@ describe('LB config validation', () => {
     const errors = [];
     const models = config.models || {};
     const router = config.Router || {};
+    const knownStrategies = Object.keys(strategies);
 
     // Check collision: model ID == Router key
     for (const modelId of Object.keys(models)) {
@@ -216,6 +131,9 @@ describe('LB config validation', () => {
     for (const [key, entry] of Object.entries(router)) {
       if (typeof entry === 'object' && entry !== null) {
         if (!entry.strategy) errors.push(`group "${key}" missing strategy`);
+        if (!knownStrategies.includes(entry.strategy)) {
+          errors.push(`group "${key}" unknown strategy "${entry.strategy}"`);
+        }
         if (!Array.isArray(entry.providers) || entry.providers.length === 0) {
           errors.push(`group "${key}" empty providers`);
         }
@@ -330,6 +248,19 @@ describe('LB config validation', () => {
       Router: { default: 'glm', haiku: 'glm' },
     });
     assert.equal(errors.length, 0);
+  });
+
+  it('should reject LB group with unknown strategy', () => {
+    const errors = validateConfig({
+      models: { 'ds': { name: 'ds', baseURL: 'https://a', apiKey: 'k' } },
+      Router: {
+        sonnet: {
+          strategy: 'round-robin',
+          providers: [{ id: 'ds', maxConns: 3 }],
+        },
+      },
+    });
+    assert.ok(errors.some(e => e.includes('unknown strategy')));
   });
 });
 

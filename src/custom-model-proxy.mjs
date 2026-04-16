@@ -29,9 +29,19 @@ import {
   readFileSync, writeFileSync, writeFile, unlinkSync, existsSync,
   watchFile, unwatchFile, mkdirSync,
 } from 'node:fs';
-import { join } from 'node:path';
-import { homedir } from 'node:os';
+import { join, dirname } from 'node:path';
 import { randomInt } from 'node:crypto';
+import { Transform } from 'node:stream';
+
+import {
+  strategies, activeConns, lbState,
+  incConn, decConn, getConns,
+  selectProvider, withConnTracking,
+} from './load-balancer.mjs';
+import {
+  MODEL_FAMILIES, detectExplicitModel, detectModelFamily, detectImage,
+} from './detectors.mjs';
+import { homedir } from 'node:os';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -68,17 +78,21 @@ const TOKEN_CHAR_RATIO = 4;
 
 if (process.argv.includes('--stop')) {
   if (existsSync(PID_PATH)) {
-    const pid = parseInt(readFileSync(PID_PATH, 'utf8').trim());
+    const raw = readFileSync(PID_PATH, 'utf8').trim();
+    const pid = parseInt(raw, 10);
+    if (!Number.isInteger(pid) || pid <= 0) { console.log(`Invalid PID file: ${raw}`); process.exit(1); }
     try { process.kill(pid, 'SIGTERM'); console.log(`Stopped proxy (PID ${pid})`); }
     catch { console.log(`Process ${pid} not running, cleaning up`); }
-    try { unlinkSync(PID_PATH); } catch {}
+    try { unlinkSync(PID_PATH); } catch (e) { console.error('PID cleanup failed:', e.message); }
   } else { console.log('Proxy not running'); }
   process.exit(0);
 }
 
 if (process.argv.includes('--status')) {
   if (existsSync(PID_PATH)) {
-    const pid = parseInt(readFileSync(PID_PATH, 'utf8').trim());
+    const raw = readFileSync(PID_PATH, 'utf8').trim();
+    const pid = parseInt(raw, 10);
+    if (!Number.isInteger(pid) || pid <= 0) { console.log(`Invalid PID file: ${raw}`); process.exit(1); }
     try { process.kill(pid, 0); console.log(`Proxy running (PID ${pid})`); }
     catch { console.log(`Proxy not running (stale PID: ${pid})`); }
   } else { console.log('Proxy not running'); }
@@ -88,12 +102,11 @@ if (process.argv.includes('--status')) {
 // ─── Logging ──────────────────────────────────────────────────────────────────
 
 /**
- * Returns current timestamp in Beijing time (UTC+8) formatted as YYYY-MM-DD HH:mm:ss
+ * Returns current timestamp in local timezone formatted as YYYY-MM-DD HH:mm:ss
  * @returns {string}
  */
-function nowBJ() {
-  const d = new Date(Date.now() + 8 * 3600_000);
-  return d.toISOString().slice(0, 19).replace('T', ' ');
+function nowLocal() {
+  return new Date().toLocaleString('sv-SE', { hour12: false });
 }
 
 /**
@@ -102,9 +115,9 @@ function nowBJ() {
  * @param {string} msg - Log message
  */
 function log(level, msg) {
-  const line = `[${nowBJ()}] [${level}] ${msg}`;
+  const line = `[${nowLocal()}] [${level}] ${msg}`;
   console.log(line);
-  try { writeFileSync(LOG_PATH, line + '\n', { flag: 'a' }); } catch {}
+  try { writeFile(LOG_PATH, line + '\n', { flag: 'a' }, (e) => { if (e) console.error('Log write failed:', e.message); }); } catch (e) { console.error('Log write failed:', e.message); }
 }
 
 /** @type {{ info: (msg: string) => void, route: (msg: string) => void, warn: (msg: string) => void, error: (msg: string) => void, debug: (msg: string) => void }} */
@@ -154,10 +167,24 @@ let config = { port: DEFAULT_PORT, models: {}, Router: {}, debug: false };
  */
 function resolveEnvVar(value) {
   if (typeof value !== 'string') return value;
-  if (value.startsWith('${') && value.endsWith('}'))
-    return process.env[value.slice(2, -1)] || value;
-  if (value.startsWith('$'))
-    return process.env[value.slice(1)] || value;
+  if (value.startsWith('${') && value.endsWith('}')) {
+    const name = value.slice(2, -1);
+    const resolved = process.env[name];
+    if (!resolved) {
+      console.warn(`Warning: env var ${value} is not set, using empty string`);
+      return '';
+    }
+    return resolved;
+  }
+  if (value.startsWith('$')) {
+    const name = value.slice(1);
+    const resolved = process.env[name];
+    if (!resolved) {
+      console.warn(`Warning: env var $${name} is not set, using empty string`);
+      return '';
+    }
+    return resolved;
+  }
   return value;
 }
 
@@ -168,7 +195,12 @@ function reloadConfig() {
     const raw = readFileSync(CONFIG_PATH, 'utf8');
     const parsed = JSON.parse(raw);
 
-    config.port = process.env.ROUTER_PORT ? parseInt(process.env.ROUTER_PORT) : (parsed.port || DEFAULT_PORT);
+    const rawPort = process.env.ROUTER_PORT;
+    const parsedPort = rawPort ? parseInt(rawPort, 10) : (parsed.port || DEFAULT_PORT);
+    if (!Number.isInteger(parsedPort) || parsedPort < 1 || parsedPort > 65535) {
+      throw new Error(`Invalid port: ${rawPort || parsed.port}. Must be integer 1-65535`);
+    }
+    config.port = parsedPort;
     config.debug = parsed.debug || false;
     config.Router = parsed.Router || {};
     config.LoadBalancer = parsed.LoadBalancer || {};
@@ -249,72 +281,9 @@ watchFile(CONFIG_PATH, { interval: 2000 }, () => {
   reloadConfig();
 });
 
-// ─── Load Balancer ─────────────────────────────────────────────────────────────
-
-/** Active connection counts per provider: providerId -> number */
-const activeConns = new Map();
-
-/** Per-group state for strategies (e.g., round-robin counters): groupKey -> any */
-const lbState = new Map();
-
-/**
- * Pluggable load balancing strategies.
- * Each strategy receives (providers, ctx) and returns a providerId or null.
- * @type {Record<string, (providers: Array<{id: string, maxConns: number}>, ctx: { getConns: (id: string) => number }) => string|null>}
- */
-const strategies = {
-  'priority-fallback': (providers, ctx) => {
-    if (!providers || providers.length === 0) return null;
-    for (const p of providers) {
-      if (ctx.getConns(p.id) < p.maxConns) return p.id;
-    }
-    // fail-open: use first provider when all at capacity
-    return providers[0].id;
-  },
-};
-
-function incConn(providerId) {
-  activeConns.set(providerId, (activeConns.get(providerId) || 0) + 1);
-}
-
-function decConn(providerId) {
-  const cur = activeConns.get(providerId) || 0;
-  activeConns.set(providerId, Math.max(0, cur - 1));
-}
-
-function getConns(providerId) {
-  return activeConns.get(providerId) || 0;
-}
-
-/**
- * Selects a provider from a LB group using the configured strategy.
- * @param {string} groupKey - Router key identifying the LB group
- * @param {{ strategy: string, providers: Array<{id: string, maxConns: number}> }} group
- * @returns {string|null} Selected providerId
- */
-function selectProvider(groupKey, group) {
-  const strategy = strategies[group.strategy];
-  if (!strategy) {
-    L.warn(`Unknown LB strategy "${group.strategy}" for "${groupKey}", using priority-fallback`);
-    return strategies['priority-fallback'](group.providers, { getConns });
-  }
-  return strategy(group.providers, { getConns });
-}
-
-/**
- * Creates a connection tracker with once-guard to prevent double-decrement.
- * @param {string} providerId - Provider to track
- * @returns {{ cleanup: () => void, providerId: string }}
- */
-function withConnTracking(providerId) {
-  incConn(providerId);
-  let cleaned = false;
-  return {
-    cleanup: () => {
-      if (!cleaned) { cleaned = true; decConn(providerId); }
-    },
-    providerId,
-  };
+/** Selects a provider, passing logger to the LB module. */
+function selectProviderWithLog(groupKey, group) {
+  return selectProvider(groupKey, group, L);
 }
 
 /**
@@ -404,71 +373,23 @@ function estimateTokenCount(body) {
  *           Returns model ID if scenario matches, null otherwise
  */
 
-/**
- * Detects explicit model override via comma-separated model IDs.
- * e.g., "original-model,my-custom-model" routes to "my-custom-model"
- */
-function detectExplicitModel(body, ctx) {
-  if (body.model && body.model.includes(',')) {
-    const modelId = body.model;
-    if (ctx.config.models[modelId]) return modelId;
-    const afterComma = body.model.split(',').slice(1).join(',');
-    if (ctx.config.models[afterComma]) return afterComma;
-    return modelId;
-  }
-  return null;
-}
-
-/**
- * Model families detected from Claude model IDs, ordered by specificity.
- * Opus checked first to avoid "sonnet" matching inside compound names.
- */
-const MODEL_FAMILIES = ['opus', 'sonnet', 'haiku'];
-
-/**
- * Detects model family from the Claude model ID in the request.
- * Maps body.model (e.g., "claude-sonnet-4-6") to Router.haiku/sonnet/opus config.
- */
-function detectModelFamily(body, ctx) {
-  if (!body.model) return null;
-  const modelLower = body.model.toLowerCase();
-  for (const family of MODEL_FAMILIES) {
-    if (modelLower.includes(family) && ctx.config.Router[family]) {
-      L.route(`modelFamily: ${body.model} -> ${family}`);
-      return family;
-    }
-  }
-  return null;
-}
-
-/**
- * Detects image/vision requests by scanning recent messages for image content.
- * Only checks the last few user messages to avoid unnecessary scanning.
- */
-function detectImage(body, ctx) {
-  if (!ctx.config.Router.image) return null;
-  const messages = body.messages || [];
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i];
-    if (msg.role !== 'user') continue;
-    if (typeof msg.content === 'string') continue;
-    if (Array.isArray(msg.content)) {
-      for (const part of msg.content) {
-        if (part.type === 'image' || part.type === 'image_url') {
-          L.route(`image: ${part.type} in msg[${i}]`);
-          return 'image';
-        }
-      }
-    }
-  }
-  return null;
-}
+/** Wrappers that add logging around imported detectors */
+const detectModelFamilyLogged = (body, ctx) => {
+  const result = detectModelFamily(body, ctx);
+  if (result) L.route(`modelFamily: ${body.model} -> ${result}`);
+  return result;
+};
+const detectImageLogged = (body, ctx) => {
+  const result = detectImage(body, ctx);
+  if (result) L.route(`image: detected in messages`);
+  return result;
+};
 
 /** @type {ScenarioDetector[]} */
 const builtinDetectors = [
   { name: 'explicit',    priority: 0, detect: detectExplicitModel },
-  { name: 'image',       priority: 5, detect: detectImage },
-  { name: 'modelFamily', priority: 8, detect: detectModelFamily },
+  { name: 'image',       priority: 5, detect: detectImageLogged },
+  { name: 'modelFamily', priority: 8, detect: detectModelFamilyLogged },
 ];
 
 /** @type {ScenarioDetector[]} */
@@ -545,8 +466,7 @@ function extractSessionId(body) {
       const parsed = JSON.parse(raw);
       if (parsed.session_id) return parsed.session_id;
     }
-  } catch {}
-  const d = new Date(Date.now() + 8 * 3600_000);
+  } catch { /* non-critical: session ID extraction is best-effort */ }
   return d.toISOString().slice(0, 10).replace(/-/g, '');
 }
 
@@ -576,7 +496,7 @@ function debugFileTag(modelId) {
  * @param {string} dir - Directory path
  */
 function ensureDir(dir) {
-  try { mkdirSync(dir, { recursive: true }); } catch {}
+  try { mkdirSync(dir, { recursive: true, mode: 0o700 }); } catch (e) { /* best-effort: dir may already exist */ }
 }
 
 /**
@@ -584,8 +504,8 @@ function ensureDir(dir) {
  */
 function dumpDebugReq(sessionDir, tag, parsedBefore, parsedAfter, target, modelId) {
   ensureDir(sessionDir);
-  const content1 = JSON.stringify({ time: nowBJ(), model: parsedBefore.model, target, routedModel: modelId, body: parsedBefore }, null, 2);
-  const content2 = JSON.stringify({ time: nowBJ(), target, body: parsedAfter }, null, 2);
+  const content1 = JSON.stringify({ time: nowLocal(), model: parsedBefore.model, target, routedModel: modelId, body: parsedBefore }, null, 2);
+  const content2 = JSON.stringify({ time: nowLocal(), target, body: parsedAfter }, null, 2);
   writeFile(join(sessionDir, `${tag}_req.json`), content1, () => {});
   writeFile(join(sessionDir, `${tag}_processed.json`), content2, () => {});
   L.debug(`Debug dump: ${tag}`);
@@ -596,7 +516,7 @@ function dumpDebugReq(sessionDir, tag, parsedBefore, parsedAfter, target, modelI
  */
 function dumpDebugRes(sessionDir, tag, statusCode, headers, body) {
   ensureDir(sessionDir);
-  const header = `# ${nowBJ()} | status: ${statusCode} | content-type: ${headers['content-type']}\n\n`;
+  const header = `# ${nowLocal()} | status: ${statusCode} | content-type: ${headers['content-type']}\n\n`;
   writeFile(join(sessionDir, `${tag}_res.txt`), header + body, () => {});
 }
 
@@ -637,13 +557,12 @@ function forwardRequest(targetURL, fwdHeaders, bodyBuf, res, debugTag, sessionDi
     method: 'POST',
     headers: { ...fwdHeaders, host: url.host, 'content-length': bodyBuf.length },
   }, (proxyRes) => {
-    const chunks = [];
-    if (config.debug) {
-      proxyRes.on('data', (chunk) => { chunks.push(chunk); });
-      proxyRes.on('end', () => {
-        dumpDebugRes(sessionDir, debugTag, proxyRes.statusCode, proxyRes.headers, Buffer.concat(chunks).toString('utf8'));
-      });
-    }
+    // H2: Handle upstream response errors to prevent unhandled exception crashes
+    proxyRes.on('error', (e) => {
+      L.error(`Upstream response error: ${e.message}`);
+      opts.onClose?.();
+      if (!res.writableEnded) res.end();
+    });
 
     // Connection cleanup on response close (normal completion + client disconnect)
     proxyRes.on('close', opts.onClose || (() => {}));
@@ -667,11 +586,36 @@ function forwardRequest(targetURL, fwdHeaders, bodyBuf, res, debugTag, sessionDi
       }
     }
 
-    proxyRes.pipe(res);
+    // H1: Use Transform stream for debug capture instead of separate on('data')
+    //     This prevents data loss from flowing mode race condition
+    if (config.debug) {
+      const debugChunks = [];
+      const debugTransform = new Transform({
+        transform(chunk, _encoding, cb) {
+          debugChunks.push(chunk);
+          cb(null, chunk);
+        },
+        flush(cb) {
+          const body = Buffer.concat(debugChunks).toString('utf8');
+          dumpDebugRes(sessionDir, debugTag, proxyRes.statusCode, proxyRes.headers, body);
+          cb();
+        },
+      });
+      proxyRes.pipe(debugTransform).pipe(res);
+    } else {
+      proxyRes.pipe(res);
+    }
+  });
+
+  // H3: Add upstream timeout to prevent connection count leaks from hanging connections
+  const UPSTREAM_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+  proxyReq.setTimeout(UPSTREAM_TIMEOUT_MS, () => {
+    L.warn(`Upstream timeout after ${UPSTREAM_TIMEOUT_MS}ms`);
+    proxyReq.destroy(new Error('Upstream timeout'));
   });
 
   proxyReq.on('error', (e) => {
-    L.error(`Forward error: ${e.message}`);
+    L.error(`Forward error: ${e.message} [target=${targetURL}, code=${e.code || 'unknown'}]`);
     opts.onClose?.();
     if (!res.headersSent) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
@@ -705,9 +649,18 @@ function forwardNonPost(targetURL, method, reqHeaders, res, onClose) {
     method,
     headers: { ...reqHeaders, host: url.host },
   }, (proxyRes) => {
+    proxyRes.on('error', (e) => {
+      L.error(`Non-POST upstream response error: ${e.message}`);
+      onClose?.();
+      if (!res.writableEnded) res.end();
+    });
     proxyRes.on('close', onClose || (() => {}));
     if (!res.headersSent) res.writeHead(proxyRes.statusCode, proxyRes.headers);
     proxyRes.pipe(res);
+  });
+
+  proxyReq.setTimeout(5 * 60 * 1000, () => {
+    proxyReq.destroy(new Error('Upstream timeout'));
   });
 
   proxyReq.on('error', () => { onClose?.(); if (!res.headersSent) { res.writeHead(502); res.end('Bad gateway'); } });
@@ -726,6 +679,16 @@ function getModelConfig(modelId) {
 }
 
 /**
+ * Falls back to the first configured model when no explicit default is available.
+ * @returns {{ id: string, providerId: string } & ModelConfig | null}
+ */
+function firstModelFallback() {
+  const firstId = Object.keys(config.models)[0];
+  if (firstId) return { id: firstId, providerId: firstId, ...config.models[firstId] };
+  return null;
+}
+
+/**
  * Gets the default model configuration.
  * Handles both string Router.default (single provider) and object (LB group).
  * Falls back to the first configured model if no explicit default.
@@ -733,27 +696,19 @@ function getModelConfig(modelId) {
  */
 function getDefaultModelConfig() {
   const defaultEntry = config.Router.default;
-  if (!defaultEntry) {
-    const firstId = Object.keys(config.models)[0];
-    if (firstId) return { id: firstId, providerId: firstId, ...config.models[firstId] };
-    return null;
-  }
+  if (!defaultEntry) return firstModelFallback();
   // String: single provider
   if (typeof defaultEntry === 'string') {
     if (config.models[defaultEntry]) return { id: defaultEntry, providerId: defaultEntry, ...config.models[defaultEntry] };
-    const firstId = Object.keys(config.models)[0];
-    if (firstId) return { id: firstId, providerId: firstId, ...config.models[firstId] };
-    return null;
+    return firstModelFallback();
   }
   // Object: LB group — select a provider
   if (typeof defaultEntry === 'object') {
-    const pickedId = selectProvider('default', defaultEntry);
+    const pickedId = selectProviderWithLog('default', defaultEntry);
     if (pickedId && config.models[pickedId]) {
       return { id: pickedId, providerId: pickedId, ...config.models[pickedId] };
     }
-    const firstId = Object.keys(config.models)[0];
-    if (firstId) return { id: firstId, providerId: firstId, ...config.models[firstId] };
-    return null;
+    return firstModelFallback();
   }
   return null;
 }
@@ -813,7 +768,7 @@ function routeAndForward(pathname, reqHeaders, rawBody, res) {
   } else if (routing.type === 'router' && typeof routing.entry === 'object') {
     // Router key → LB group
     groupKey = routing.key;
-    const pickedId = selectProvider(groupKey, routing.entry);
+    const pickedId = selectProviderWithLog(groupKey, routing.entry);
     if (!pickedId) {
       res.writeHead(503, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ type: 'error', error: { message: `LB group "${groupKey}" has no available providers` } }));
@@ -842,19 +797,24 @@ function routeAndForward(pathname, reqHeaders, rawBody, res) {
   const target = modelConf.baseURL.replace(/\/+$/, '') + pathname;
   const actualModel = modelConf.name || providerId;
   const originalModel = parsed.model;
-  parsed.model = actualModel;
+
+  // Build forwarded body immutably — never mutate the original parsed object
+  const forwarded = {
+    ...parsed,
+    model: actualModel,
+    ...(modelConf.maxTokens && parsed.max_tokens && parsed.max_tokens > modelConf.maxTokens
+      ? { max_tokens: modelConf.maxTokens }
+      : {}),
+  };
+
   if (originalModel !== actualModel) {
     L.info(`Model: ${originalModel} -> ${actualModel}`);
   }
-
-  if (modelConf.maxTokens && parsed.max_tokens) {
-    if (parsed.max_tokens > modelConf.maxTokens) {
-      L.info(`max_tokens: ${parsed.max_tokens} -> ${modelConf.maxTokens}`);
-      parsed.max_tokens = modelConf.maxTokens;
-    }
+  if (modelConf.maxTokens && parsed.max_tokens && parsed.max_tokens > modelConf.maxTokens) {
+    L.info(`max_tokens: ${parsed.max_tokens} -> ${modelConf.maxTokens}`);
   }
 
-  const bodyBuf = Buffer.from(JSON.stringify(parsed));
+  const bodyBuf = Buffer.from(JSON.stringify(forwarded));
 
   const fwdHeaders = { ...reqHeaders };
   delete fwdHeaders['content-length'];
@@ -872,13 +832,13 @@ function routeAndForward(pathname, reqHeaders, rawBody, res) {
   const tag = config.debug ? debugFileTag(actualModel) : null;
   const sessionDir = config.debug ? join(DEBUG_DIR, extractSessionId(originalParsed)) : null;
   if (config.debug) {
-    dumpDebugReq(sessionDir, tag, originalParsed, parsed, target, actualModel);
+    dumpDebugReq(sessionDir, tag, originalParsed, forwarded, target, actualModel);
   }
 
   forwardRequest(target, fwdHeaders, bodyBuf, res, tag, sessionDir, {
     onClose: tracker.cleanup,
     providerId,
-    parsed,
+    parsed: forwarded,
   });
 }
 
@@ -952,8 +912,9 @@ const server = createServer(async (req, res) => {
 
 // ─── Startup ──────────────────────────────────────────────────────────────────
 
-try { mkdirSync(LOG_DIR, { recursive: true }); } catch {}
-try { writeFileSync(LOG_PATH, ''); } catch {}
+try { mkdirSync(LOG_DIR, { recursive: true }); } catch (e) { console.error('Log dir creation failed:', e.message); }
+// Append a startup separator instead of truncating — preserves log history
+try { writeFileSync(LOG_PATH, `\n${'='.repeat(60)}\n`, { flag: 'a' }); } catch (e) { console.error('Log init failed:', e.message); }
 
 const port = config.port || DEFAULT_PORT;
 server.listen(port, '127.0.0.1', () => {
@@ -978,7 +939,7 @@ server.listen(port, '127.0.0.1', () => {
 function shutdown() {
   L.info('Shutting down...');
   unwatchFile(CONFIG_PATH);
-  try { unlinkSync(PID_PATH); } catch {}
+  try { unlinkSync(PID_PATH); } catch (e) { /* best-effort during shutdown */ }
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 3000);
 }
