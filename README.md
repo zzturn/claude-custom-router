@@ -166,7 +166,7 @@ The default strategy checks providers in configured order and selects the first 
 When `LoadBalancer.showProvider` is `true`:
 - **Response header**: `X-Router-Provider: deepseek-sonnet`
 - **SSE comment**: `: router_provider: deepseek-sonnet` (in streaming responses)
-- **Logs**: `[ROUTE] sonnet: deepseek-sonnet [active: 2/5]`
+- **Request logs**: `[a3k9f2][abc123] claude-sonnet-4-5 -> deepseek-chat [sonnet 2/5 active]`
 - **Health endpoint**: `/health` includes LB group status with active connection counts
 
 ### Config Validation
@@ -301,10 +301,14 @@ Set `"debug": true` in config to enable request/response dumps:
 ```
 ~/.claude-custom-router.d/logs/debug/
   └── <session-id>/
-      ├── <timestamp>_<random>_<model>_req.json      # Original request
-      ├── <timestamp>_<random>_<model>_processed.json # Routed request
-      └── <timestamp>_<random>_<model>_res.txt        # Response
+      ├── <timestamp>_<reqid>_<model>_req.json       # Original request
+      ├── <timestamp>_<reqid>_<model>_processed.json # Routed request
+      └── <timestamp>_<reqid>_<model>_res.txt        # Response
 ```
+
+- Request log prefixes include the generated request ID and the first 6 characters of `session_id` when available: `[reqid][session6]`.
+- Debug dumps are grouped by `session_id`; when no session is present, the proxy falls back to today's date (`YYYYMMDD`).
+- Upstream non-2xx responses are logged with their decoded response body (truncated for very large bodies).
 
 ## Integration with Claude Code
 

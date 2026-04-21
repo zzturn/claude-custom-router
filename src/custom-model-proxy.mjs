@@ -32,6 +32,7 @@ import {
 import { join, dirname } from 'node:path';
 import { randomInt } from 'node:crypto';
 import { Transform } from 'node:stream';
+import { createGunzip, createInflate, createBrotliDecompress } from 'node:zlib';
 
 import {
   strategies, activeConns, lbState,
@@ -73,6 +74,9 @@ const DEFAULT_PORT = 8082;
 
 /** @type {number} Approximate characters per token for estimation */
 const TOKEN_CHAR_RATIO = 4;
+
+/** @type {number} Maximum non-2xx response body characters to print in logs */
+const MAX_ERROR_LOG_CHARS = 4000;
 
 // ─── CLI Commands ─────────────────────────────────────────────────────────────
 
@@ -128,6 +132,68 @@ const L = {
   debug: (msg) => { if (config.debug) log('DEBUG', msg); },
 };
 
+// ─── Request Context ──────────────────────────────────────────────────────────
+
+const REQ_ID_CHARS = 'abcdefghijklmnopqrstuvwxyz0123456789';
+const SESSION_ID_PREFIX_LEN = 6;
+
+/**
+ * Generates a unique 6-character alphanumeric request ID.
+ * @returns {string} e.g. "a3k9f2"
+ */
+function nextReqId() {
+  let id = '';
+  for (let i = 0; i < 6; i++) {
+    id += REQ_ID_CHARS[randomInt(0, REQ_ID_CHARS.length)];
+  }
+  return id;
+}
+
+/**
+ * Extracts the request session ID from metadata, if present.
+ * @param {Object} body - Request body
+ * @returns {string|null}
+ */
+function getRequestSessionId(body) {
+  try {
+    const raw = body.metadata?.user_id;
+    if (typeof raw === 'string') {
+      const parsed = JSON.parse(raw);
+      if (typeof parsed.session_id === 'string' && parsed.session_id) return parsed.session_id;
+    }
+  } catch { /* best-effort only */ }
+  return null;
+}
+
+/**
+ * Creates a request-scoped logger that prefixes every message with the request ID and session prefix.
+ * @param {string} reqId - Short request identifier (e.g. "a3k9f2")
+ * @param {string|null} [sessionId] - Full session identifier, if available
+ * @returns {{ info: Function, warn: Function, error: Function, debug: Function }}
+ */
+function createReqLog(reqId, sessionId = null) {
+  const sessionPrefix = sessionId ? sessionId.slice(0, SESSION_ID_PREFIX_LEN) : null;
+  const pfx = sessionPrefix ? `[${reqId}][${sessionPrefix}]` : `[${reqId}]`;
+  return {
+    info:  (msg) => log('INFO',  `${pfx} ${msg}`),
+    warn:  (msg) => log('WARN',  `${pfx} ${msg}`),
+    error: (msg) => log('ERROR', `${pfx} ${msg}`),
+    debug: (msg) => { if (config.debug) log('DEBUG', `${pfx} ${msg}`); },
+  };
+}
+
+/**
+ * Creates a request context object with ID, session metadata, scoped logger, and start time.
+ * @param {Object} body - Request body
+ * @returns {{ id: string, sessionId: string|null, sessionDirId: string, log: ReturnType<typeof createReqLog>, startTime: number }}
+ */
+function createReqContext(body) {
+  const id = nextReqId();
+  const sessionId = getRequestSessionId(body);
+  const sessionDirId = sessionId || new Date().toISOString().slice(0, 10).replace(/-/g, '');
+  return { id, sessionId, sessionDirId, log: createReqLog(id, sessionId), startTime: Date.now() };
+}
+
 // ─── Config Management ────────────────────────────────────────────────────────
 
 /**
@@ -156,7 +222,7 @@ const L = {
  */
 
 /** @type {AppConfig} */
-let config = { port: DEFAULT_PORT, models: {}, Router: {}, debug: false };
+let config = { port: DEFAULT_PORT, models: {}, Router: {}, debug: false, upstreamTimeoutMs: 5 * 60 * 1000 };
 
 /**
  * Resolves environment variable references in string values.
@@ -203,6 +269,7 @@ function reloadConfig() {
     config.debug = parsed.debug || false;
     config.Router = parsed.Router || {};
     config.LoadBalancer = parsed.LoadBalancer || {};
+    config.upstreamTimeoutMs = parsed.upstreamTimeoutMs || 5 * 60 * 1000;
 
     config.models = {};
     for (const [id, m] of Object.entries(parsed.models || {})) {
@@ -423,27 +490,29 @@ await loadCustomDetectors();
  * Detectors are checked in priority order; first match wins.
  * @param {Object} body - Anthropic API request body
  * @param {number} tokenCount - Estimated token count
+ * @param {{ info: Function, warn: Function, error: Function, debug: Function }} [reqLog] - Optional request-scoped logger
  * @returns {string|null} Resolved model ID, or null if no match
  */
-function resolveModel(body, tokenCount) {
+function resolveModel(body, tokenCount, reqLog) {
+  const logger = reqLog || L;
   const ctx = { tokenCount, config };
 
   for (const detector of allDetectors) {
     const modelId = detector.detect(body, ctx);
     if (modelId) {
-      L.debug(`${detector.name} -> ${modelId}`);
+      logger.debug(`${detector.name} -> ${modelId}`);
       return modelId;
     }
   }
 
   if (body.model && ctx.config.models[body.model]) {
-    L.debug(`direct -> ${body.model}`);
+    logger.debug(`direct -> ${body.model}`);
     return body.model;
   }
 
   const defaultModel = config.Router.default;
   if (defaultModel) {
-    L.debug(`default -> default`);
+    logger.debug(`default -> default`);
     return 'default';
   }
 
@@ -459,14 +528,7 @@ function resolveModel(body, tokenCount) {
  * @returns {string} Session identifier
  */
 function extractSessionId(body) {
-  try {
-    const raw = body.metadata?.user_id;
-    if (typeof raw === 'string') {
-      const parsed = JSON.parse(raw);
-      if (parsed.session_id) return parsed.session_id;
-    }
-  } catch { /* non-critical: session ID extraction is best-effort */ }
-  return d.toISOString().slice(0, 10).replace(/-/g, '');
+  return getRequestSessionId(body) || new Date().toISOString().slice(0, 10).replace(/-/g, '');
 }
 
 /**
@@ -479,15 +541,15 @@ function sanitizeModelId(id) {
 }
 
 /**
- * Generates a unique debug file tag from timestamp, random number, and model ID.
+ * Generates a unique debug file tag from timestamp, request ID, and model ID.
  * @param {string} modelId - Model ID for the tag
+ * @param {string} reqId - Request ID for correlation with log lines
  * @returns {string} Unique file tag
  */
-function debugFileTag(modelId) {
+function debugFileTag(modelId, reqId) {
   const ts = Date.now();
-  const rand = String(randomInt(100, 1000));
   const safe = sanitizeModelId(modelId);
-  return `${ts}_${rand}_${safe}`;
+  return `${ts}_${reqId}_${safe}`;
 }
 
 /**
@@ -519,9 +581,105 @@ function dumpDebugRes(sessionDir, tag, statusCode, headers, body) {
   writeFile(join(sessionDir, `${tag}_res.txt`), header + body, () => {});
 }
 
-// ─── Request Forwarding ───────────────────────────────────────────────────────
+/**
+ * Returns a decompression stream for the given content-encoding, or null if no decompression needed.
+ * @param {string|undefined} encoding - The content-encoding header value
+ * @returns {import('node:zlib').Gunzip|import('node:zlib').Inflate|import('node:zlib').BrotliDecompress|null}
+ */
+function getDecompressStream(encoding) {
+  if (!encoding) return null;
+  const enc = encoding.toLowerCase();
+  if (enc.includes('gzip')) return createGunzip();
+  if (enc.includes('deflate')) return createInflate();
+  if (enc.includes('br')) return createBrotliDecompress();
+  return null;
+}
 
-let requestId = 0;
+/**
+ * Returns whether a content-type is safe to print as text in logs.
+ * @param {string|undefined} contentType
+ * @returns {boolean}
+ */
+function isTextContentType(contentType) {
+  if (!contentType) return true;
+  const ct = contentType.toLowerCase();
+  return ct.startsWith('text/')
+    || ct.includes('json')
+    || ct.includes('xml')
+    || ct.includes('javascript')
+    || ct.includes('x-www-form-urlencoded');
+}
+
+/**
+ * Decodes an upstream response body, including compressed responses.
+ * Returns a best-effort printable string for logging/debug.
+ * @param {Buffer} raw - Raw upstream response body
+ * @param {import('node:http').IncomingHttpHeaders} headers - Upstream response headers
+ * @param {(body: string) => void} onDecoded - Callback with decoded body text
+ */
+function decodeResponseBody(raw, headers, onDecoded) {
+  const contentType = headers['content-type'];
+  if (!isTextContentType(contentType)) {
+    onDecoded(`[non-text body: ${contentType || 'unknown content-type'}]`);
+    return;
+  }
+
+  const decompress = getDecompressStream(headers['content-encoding']);
+  if (!decompress) {
+    onDecoded(raw.toString('utf8'));
+    return;
+  }
+
+  let decoded = '';
+  decompress.on('data', (chunk) => { decoded += chunk.toString('utf8'); });
+  decompress.on('end', () => onDecoded(decoded));
+  decompress.on('error', () => {
+    onDecoded(`[binary: ${headers['content-encoding']}]`);
+  });
+  decompress.end(raw);
+}
+
+/**
+ * Formats response text for compact one-line error logging.
+ * @param {string} body
+ * @returns {string}
+ */
+function formatErrorBodyForLog(body) {
+  const normalized = body.replace(/\s+/g, ' ').trim();
+  if (!normalized) return '[empty body]';
+  if (normalized.length <= MAX_ERROR_LOG_CHARS) return normalized;
+  const truncated = normalized.slice(0, MAX_ERROR_LOG_CHARS);
+  return `${truncated}... [truncated ${normalized.length - MAX_ERROR_LOG_CHARS} chars]`;
+}
+
+/**
+ * Logs a non-2xx upstream response body.
+ * @param {{ warn: (msg: string) => void }} logger
+ * @param {number} statusCode
+ * @param {import('node:http').IncomingHttpHeaders} headers
+ * @param {string} body
+ */
+function logNon2xxResponse(logger, statusCode, headers, body) {
+  const ct = headers['content-type'] || 'unknown';
+  logger.warn(`Upstream ${statusCode} response body (${ct}): ${formatErrorBodyForLog(body)}`);
+}
+
+/**
+ * Creates a once-guarded finalizer for request lifecycle cleanup.
+ * Prevents double cleanup when multiple stream/socket events fire.
+ * @param {(statusCode?: number) => void} onClose - Finalizer callback
+ * @returns {(statusCode?: number) => void}
+ */
+function onceOnClose(onClose) {
+  let closed = false;
+  return (statusCode) => {
+    if (closed) return;
+    closed = true;
+    onClose?.(statusCode);
+  };
+}
+
+// ─── Request Forwarding ───────────────────────────────────────────────────────
 
 /**
  * Forwards a POST request to the target URL and streams the response back.
@@ -531,7 +689,7 @@ let requestId = 0;
  * @param {import('node:http').ServerResponse} res - Client response object
  * @param {string|null} debugTag - Debug file tag (null if debug disabled)
  * @param {string|null} sessionDir - Debug session directory (null if debug disabled)
- * @param {{ onClose?: () => void, providerId?: string, parsed?: Object }} [opts] - Optional callbacks and metadata
+ * @param {{ onClose?: () => void, providerId?: string, parsed?: Object, reqLog?: { warn: (msg: string) => void } }} [opts] - Optional callbacks and metadata
  */
 function forwardRequest(targetURL, fwdHeaders, bodyBuf, res, debugTag, sessionDir, opts = {}) {
   let url;
@@ -548,6 +706,8 @@ function forwardRequest(targetURL, fwdHeaders, bodyBuf, res, debugTag, sessionDi
   const isHttps = url.protocol === 'https:';
   const lib = isHttps ? httpsRequest : httpRequest;
   const lbConf = getLbConfig();
+  const finishClose = onceOnClose(opts.onClose);
+  let upstreamStatusCode;
 
   const proxyReq = lib({
     hostname: url.hostname,
@@ -557,14 +717,16 @@ function forwardRequest(targetURL, fwdHeaders, bodyBuf, res, debugTag, sessionDi
     headers: { ...fwdHeaders, host: url.host, 'content-length': bodyBuf.length },
   }, (proxyRes) => {
     // H2: Handle upstream response errors to prevent unhandled exception crashes
+    upstreamStatusCode = proxyRes.statusCode;
+
     proxyRes.on('error', (e) => {
       L.error(`Upstream response error: ${e.message}`);
-      opts.onClose?.();
+      finishClose(undefined);
       if (!res.writableEnded) res.end();
     });
 
     // Connection cleanup on response close (normal completion + client disconnect)
-    proxyRes.on('close', opts.onClose || (() => {}));
+    proxyRes.on('close', () => finishClose(proxyRes.statusCode));
 
     if (!res.headersSent) {
       const headers = { ...proxyRes.headers };
@@ -585,9 +747,9 @@ function forwardRequest(targetURL, fwdHeaders, bodyBuf, res, debugTag, sessionDi
       }
     }
 
-    // H1: Use Transform stream for debug capture instead of separate on('data')
-    //     This prevents data loss from flowing mode race condition
-    if (config.debug) {
+    // Capture body when debug is enabled or upstream returned non-2xx, while still streaming through.
+    const shouldCaptureBody = config.debug || (proxyRes.statusCode >= 400 && proxyRes.statusCode < 600);
+    if (shouldCaptureBody) {
       const debugChunks = [];
       const debugTransform = new Transform({
         transform(chunk, _encoding, cb) {
@@ -595,9 +757,16 @@ function forwardRequest(targetURL, fwdHeaders, bodyBuf, res, debugTag, sessionDi
           cb(null, chunk);
         },
         flush(cb) {
-          const body = Buffer.concat(debugChunks).toString('utf8');
-          dumpDebugRes(sessionDir, debugTag, proxyRes.statusCode, proxyRes.headers, body);
-          cb();
+          const raw = Buffer.concat(debugChunks);
+          decodeResponseBody(raw, proxyRes.headers, (decodedBody) => {
+            if (config.debug) {
+              dumpDebugRes(sessionDir, debugTag, proxyRes.statusCode, proxyRes.headers, decodedBody);
+            }
+            if (proxyRes.statusCode >= 400 && proxyRes.statusCode < 600) {
+              logNon2xxResponse(opts.reqLog || L, proxyRes.statusCode, proxyRes.headers, decodedBody);
+            }
+            cb();
+          });
         },
       });
       proxyRes.pipe(debugTransform).pipe(res);
@@ -606,16 +775,30 @@ function forwardRequest(targetURL, fwdHeaders, bodyBuf, res, debugTag, sessionDi
     }
   });
 
+  const abortUpstream = (reason) => {
+    if (proxyReq.destroyed) return;
+    proxyReq.destroy(new Error(reason));
+  };
+
+  res.on('finish', () => finishClose(upstreamStatusCode ?? res.statusCode));
+  res.on('close', () => {
+    if (!res.writableFinished) {
+      L.warn('Client disconnected before response completed');
+      abortUpstream('Client disconnected');
+    }
+    finishClose(upstreamStatusCode ?? res.statusCode);
+  });
+
   // H3: Add upstream timeout to prevent connection count leaks from hanging connections
-  const UPSTREAM_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
-  proxyReq.setTimeout(UPSTREAM_TIMEOUT_MS, () => {
-    L.warn(`Upstream timeout after ${UPSTREAM_TIMEOUT_MS}ms`);
+  const upstreamTimeoutMs = config.upstreamTimeoutMs;
+  proxyReq.setTimeout(upstreamTimeoutMs, () => {
+    L.warn(`Upstream timeout after ${upstreamTimeoutMs}ms`);
     proxyReq.destroy(new Error('Upstream timeout'));
   });
 
   proxyReq.on('error', (e) => {
     L.error(`Forward error: ${e.message} [target=${targetURL}, code=${e.code || 'unknown'}]`);
-    opts.onClose?.();
+    finishClose(undefined);
     if (!res.headersSent) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ type: 'error', error: { message: `Proxy error: ${e.message}` } }));
@@ -640,6 +823,8 @@ function forwardNonPost(targetURL, method, reqHeaders, res, onClose) {
 
   const isHttps = url.protocol === 'https:';
   const lib = isHttps ? httpsRequest : httpRequest;
+  const finishClose = onceOnClose(onClose);
+  let upstreamStatusCode;
 
   const proxyReq = lib({
     hostname: url.hostname,
@@ -648,21 +833,36 @@ function forwardNonPost(targetURL, method, reqHeaders, res, onClose) {
     method,
     headers: { ...reqHeaders, host: url.host },
   }, (proxyRes) => {
+    upstreamStatusCode = proxyRes.statusCode;
     proxyRes.on('error', (e) => {
       L.error(`Non-POST upstream response error: ${e.message}`);
-      onClose?.();
+      finishClose(undefined);
       if (!res.writableEnded) res.end();
     });
-    proxyRes.on('close', onClose || (() => {}));
+    proxyRes.on('close', () => finishClose(proxyRes.statusCode));
     if (!res.headersSent) res.writeHead(proxyRes.statusCode, proxyRes.headers);
     proxyRes.pipe(res);
   });
 
-  proxyReq.setTimeout(5 * 60 * 1000, () => {
+  const abortUpstream = (reason) => {
+    if (proxyReq.destroyed) return;
+    proxyReq.destroy(new Error(reason));
+  };
+
+  res.on('finish', () => finishClose(upstreamStatusCode ?? res.statusCode));
+  res.on('close', () => {
+    if (!res.writableFinished) abortUpstream('Client disconnected');
+    finishClose(upstreamStatusCode ?? res.statusCode);
+  });
+
+  proxyReq.setTimeout(config.upstreamTimeoutMs, () => {
     proxyReq.destroy(new Error('Upstream timeout'));
   });
 
-  proxyReq.on('error', () => { onClose?.(); if (!res.headersSent) { res.writeHead(502); res.end('Bad gateway'); } });
+  proxyReq.on('error', () => {
+    finishClose(undefined);
+    if (!res.headersSent) { res.writeHead(502); res.end('Bad gateway'); }
+  });
   proxyReq.end();
 }
 
@@ -728,11 +928,14 @@ function routeAndForward(pathname, reqHeaders, rawBody, res) {
     return res.end(JSON.stringify({ type: 'error', error: { message: 'Invalid JSON' } }));
   }
 
+  // Create request context after successful JSON parse
+  const ctx = createReqContext(parsed);
+
   // Snapshot original request before any modification
   const originalParsed = JSON.parse(rawBody);
 
   // Resolve model key (Router key or model config ID)
-  const resolvedKey = resolveModel(parsed, estimateTokenCount(parsed));
+  const resolvedKey = resolveModel(parsed, estimateTokenCount(parsed), ctx.log);
   if (!resolvedKey) {
     res.writeHead(400, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ type: 'error', error: { message: 'No model resolved and no default configured' } }));
@@ -804,10 +1007,10 @@ function routeAndForward(pathname, reqHeaders, rawBody, res) {
   // Consolidated routing log — one line per request
   const maxConns = groupKey ? (routing.entry?.providers?.find(p => p.id === providerId)?.maxConns || '?') : null;
   const lbInfo = groupKey ? ` [${groupKey} ${getConns(providerId)}/${maxConns} active]` : '';
-  L.info(`${originalModel} -> ${actualModel}${lbInfo}`);
-  L.debug(`-> ${target}`);
+  ctx.log.info(`${originalModel} -> ${actualModel}${lbInfo}`);
+  ctx.log.debug(`-> ${target}`);
   if (modelConf.maxTokens && parsed.max_tokens && parsed.max_tokens > modelConf.maxTokens) {
-    L.info(`  max_tokens: ${parsed.max_tokens} -> ${modelConf.maxTokens}`);
+    ctx.log.info(`  max_tokens: ${parsed.max_tokens} -> ${modelConf.maxTokens}`);
   }
 
   const bodyBuf = Buffer.from(JSON.stringify(forwarded));
@@ -823,16 +1026,24 @@ function routeAndForward(pathname, reqHeaders, rawBody, res) {
   }
 
   // Debug dump
-  const tag = config.debug ? debugFileTag(actualModel) : null;
-  const sessionDir = config.debug ? join(DEBUG_DIR, extractSessionId(originalParsed)) : null;
+  const tag = config.debug ? debugFileTag(actualModel, ctx.id) : null;
+  const sessionDir = config.debug ? join(DEBUG_DIR, ctx.sessionDirId) : null;
   if (config.debug) {
     dumpDebugReq(sessionDir, tag, originalParsed, forwarded, target, actualModel);
   }
 
   forwardRequest(target, fwdHeaders, bodyBuf, res, tag, sessionDir, {
-    onClose: tracker.cleanup,
+    onClose: (statusCode) => {
+      tracker.cleanup();
+      const elapsed = Date.now() - ctx.startTime;
+      const lbEnd = groupKey ? ` [${groupKey} ${getConns(providerId)}/${maxConns} active]` : '';
+      const is2xx = Number.isInteger(statusCode) && statusCode >= 200 && statusCode < 300;
+      const logFn = is2xx ? ctx.log.info : ctx.log.warn;
+      logFn(`END ${actualModel} ${statusCode ?? '?'} ${elapsed}ms${lbEnd}`);
+    },
     providerId,
     parsed: forwarded,
+    reqLog: ctx.log,
   });
 }
 

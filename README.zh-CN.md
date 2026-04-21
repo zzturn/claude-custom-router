@@ -161,7 +161,7 @@ curl http://127.0.0.1:8082/health
 `LoadBalancer.showProvider` 为 `true` 时：
 - **响应头**：`X-Router-Provider: deepseek-sonnet`
 - **SSE 注释**：`: router_provider: deepseek-sonnet`（仅流式响应）
-- **日志**：`[ROUTE] sonnet: deepseek-sonnet [active: 2/5]`
+- **请求日志**：`[a3k9f2][abc123] claude-sonnet-4-5 -> deepseek-chat [sonnet 2/5 active]`
 - **健康检查**：`/health` 返回 LB 组状态和活跃连接数
 
 ### 配置校验
@@ -269,10 +269,14 @@ node src/custom-model-proxy.mjs --status # 查看状态
 ```
 ~/.claude-custom-router.d/logs/debug/
   └── <session-id>/
-      ├── <timestamp>_<random>_<model>_req.json       # 原始请求
-      ├── <timestamp>_<random>_<model>_processed.json  # 路由后请求
-      └── <timestamp>_<random>_<model>_res.txt         # 响应内容
+      ├── <timestamp>_<reqid>_<model>_req.json        # 原始请求
+      ├── <timestamp>_<reqid>_<model>_processed.json  # 路由后请求
+      └── <timestamp>_<reqid>_<model>_res.txt         # 响应内容
 ```
+
+- 请求日志前缀会带上生成的 `reqid`，以及 `session_id` 存在时的前 6 位：`[reqid][session6]`。
+- Debug 转储按 `session_id` 分目录；如果请求里没有 session，则回退到当天日期（`YYYYMMDD`）。
+- 上游返回非 2xx 时，代理会把解码后的响应体写入日志；超长内容会被截断。
 
 ## 与 Claude Code 集成
 
