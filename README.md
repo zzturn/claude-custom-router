@@ -1,75 +1,77 @@
 # Claude Custom Router
 
-A lightweight, zero-dependency proxy that routes [Claude Code](https://docs.anthropic.com/en/docs/claude-code) API requests to different LLM providers based on model ID mapping and scenario detection.
+中文 | [English](README.en.md)
 
-## Why?
+一个轻量级、零依赖的代理服务器，根据场景检测将 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) 的 API 请求路由到不同的 LLM 提供商。
 
-Claude Code sends all requests to a single Anthropic API endpoint. If you want to:
+## 为什么需要它？
 
-- **Route different model families** (Haiku/Sonnet/Opus) to different providers
-- Route **image requests** to a vision-capable model
-- **Load balance** across multiple providers to avoid rate limiting
-- Use a **default provider** as fallback
+Claude Code 默认将所有请求发送到 Anthropic 的 API。如果你想要：
 
-...you'd need to manually switch models or maintain separate configurations. This proxy automates it.
+- 后台任务使用**便宜的模型**，复杂任务保留 Claude
+- 图片请求路由到**视觉模型**
+- **负载均衡**多个提供商，避免被限流
+- 长上下文使用**大窗口模型**
+- 扩展思考使用**推理专用模型**
 
-## How It Works
+这个代理帮你自动完成。
+
+## 工作原理
 
 ```
-┌─────────────┐     ┌──────────────────────┐     ┌─────────────────┐
-│ Claude Code  │────▶│  Custom Model Proxy   │────▶│  Claude API     │
-│              │     │                      │     ├─────────────────┤
-│              │     │  Routing:            │     │  GLM / DeepSeek │
-│              │     │  • Explicit override  │     │  Qwen / Others  │
-│              │     │  • Image detection    │     │  ...            │
-│              │     │  • Model ID mapping   │     └─────────────────┘
-│              │     │    (haiku/sonnet/opus)│
-│              │     │                      │◀── Custom scenarios
-│              │     └──────────────────────┘    (extensible)
-└─────────────┘
+Claude Code ──▶ 场景检测链 ──▶ 匹配模型 ──▶ 转发到对应提供商
+                 │
+                 ├── explicit   (优先级 0)  显式模型覆盖
+                 ├── image      (优先级 5)  图片检测
+                 ├── longContext (优先级 10) 长上下文
+                 ├── subagent   (优先级 20) 子代理标签
+                 ├── background (优先级 30) 后台任务
+                 ├── webSearch  (优先级 40) 网页搜索
+                 ├── think      (优先级 50) 扩展思考
+                 └── [自定义场景...]       可扩展
 ```
 
-Each request goes through a chain of **detectors** (sorted by priority). The first match determines which model handles the request.
+请求按优先级依次经过所有检测器，第一个匹配成功的决定目标模型。
 
-## Quick Start
+## 快速开始
 
-### 1. Install
+### 安装
 
 ```bash
 git clone https://github.com/your-username/claude-custom-router.git
 cd claude-custom-router
 ```
 
-### 2. Configure
+### 配置
 
 ```bash
-# Copy the example config and edit it
+# 复制示例配置
 cp config/custom-models.example.json ~/.claude-custom-router.json
 
-# Edit with your API keys and model endpoints
+# 编辑配置（填入你的 API Key 和模型端点）
 vim ~/.claude-custom-router.json
 ```
 
-### 3. Run
+### 启动
 
 ```bash
-# Start the proxy
+# 启动代理
 node src/custom-model-proxy.mjs
 
-# Configure Claude Code to use it
+# 配置 Claude Code 使用代理
 export ANTHROPIC_BASE_URL="http://127.0.0.1:8082"
 export ANTHROPIC_API_KEY="your-key-here"
 ```
 
-### 4. Verify
+### 验证
 
 ```bash
 curl http://127.0.0.1:8082/health
 ```
 
-## Configuration
+## 配置详解
 
-Config file: `~/.claude-custom-router.json` (or `$ROUTER_CONFIG_PATH`)
+配置文件：`~/.claude-custom-router.json`（或 `$ROUTER_CONFIG_PATH`）
 
 ```json
 {
@@ -78,15 +80,10 @@ Config file: `~/.claude-custom-router.json` (or `$ROUTER_CONFIG_PATH`)
   "upstreamTimeoutMs": 360000,
   "providers": {
     "default-provider": {
-      "model": "actual-model-name",
+      "model": "实际模型名称",
       "baseURL": "https://api.provider.com/v1",
-      "apiKey": "${MY_API_KEY}",
+      "apiKey": "${环境变量名}",
       "maxTokens": 8192
-    },
-    "haiku-provider": {
-      "model": "haiku-model-name",
-      "baseURL": "https://api.haiku-provider.com/v1",
-      "apiKey": "${HAIKU_API_KEY}"
     },
     "glm": {
       "model": "glm-4",
@@ -97,16 +94,6 @@ Config file: `~/.claude-custom-router.json` (or `$ROUTER_CONFIG_PATH`)
       "model": "qwen-plus",
       "baseURL": "https://dashscope.aliyuncs.com/apps/anthropic",
       "apiKey": "${QWEN_API_KEY}"
-    },
-    "opus-provider": {
-      "model": "opus-model-name",
-      "baseURL": "https://api.opus-provider.com/v1",
-      "apiKey": "${OPUS_API_KEY}"
-    },
-    "vision-provider": {
-      "model": "vision-model-name",
-      "baseURL": "https://api.provider.com/v1",
-      "apiKey": "${API_KEY}"
     }
   },
   "pools": {
@@ -120,10 +107,10 @@ Config file: `~/.claude-custom-router.json` (or `$ROUTER_CONFIG_PATH`)
   },
   "routes": {
     "default": { "provider": "default-provider" },
-    "image": { "provider": "vision-provider" },
-    "haiku": { "provider": "haiku-provider" },
+    "image": { "provider": "default-provider" },
+    "haiku": { "provider": "default-provider" },
     "sonnet": { "pool": "sonnet-primary" },
-    "opus": { "provider": "opus-provider" }
+    "opus": { "provider": "default-provider" }
   },
   "loadBalancer": {
     "showProvider": true
@@ -131,34 +118,45 @@ Config file: `~/.claude-custom-router.json` (or `$ROUTER_CONFIG_PATH`)
 }
 ```
 
-### Configuration Layers
+### 环境变量引用
 
-- `routes`: business-facing entrypoints such as `default`, `haiku`, `sonnet`, `opus`, `image`
-- `pools`: named load-balancing pools that can be reused by multiple routes
-- `providers`: concrete upstream endpoints plus the actual model name sent upstream
+在 `apiKey` 和 `baseURL` 中使用 `${ENV_VAR}` 或 `$ENV_VAR` 引用环境变量：
 
-Each route must choose exactly one target:
+```json
+{
+  "apiKey": "${MY_API_KEY}",
+  "baseURL": "$PROVIDER_BASE_URL"
+}
+```
+
+### 配置分层
+
+- `routes`：业务入口，比如 `default`、`haiku`、`sonnet`、`opus`、`image`
+- `pools`：可复用的负载均衡池
+- `providers`：具体的上游 endpoint、账号和实际发给上游的模型名
+
+每个 route 必须二选一：
 
 - `{ "provider": "provider-id" }`
 - `{ "pool": "pool-id" }`
 
-## Load Balancing
+## 负载均衡
 
-When running Claude Code agent teams, multiple agents make concurrent LLM API calls that can overwhelm a single provider. Load balancing distributes requests across multiple providers based on **active connection counts**.
+当启动 Claude Code agent team 时，多个 agent 并发调用 LLM API，可能导致单一提供商被限流（429）。负载均衡通过**活跃连接数**在多个提供商之间分配请求。
 
-### Priority Fallback Strategy
+### Priority Fallback 策略
 
-The default strategy checks providers in configured order and selects the first one with available capacity (`activeConns < maxConns`). This is ideal when you have a primary provider and 1-2 backups — the primary handles most traffic, and backups only activate when the primary is saturated.
+默认策略按配置顺序检查提供商，选择第一个有可用容量的（`activeConns < maxConns`）。适合有主力提供商 + 1-2 个 backup 的场景——主力处理大部分流量，backup 仅在主力饱和时启用。
 
-### Capacity Unit
+### 容量统计单位
 
-Load balancing capacity is keyed by the `providerId`, which is the same ID used in `pools.<pool>.providers[*].provider`.
+负载均衡的容量统计单位是 `providerId`，也就是 `pools.<pool>.providers[*].provider` 使用的那个 ID。
 
-- Reusing the same `providerId` across multiple pools shares one connection pool. For example, if both `haiku-primary` and `sonnet-primary` reference `glm`, they share the same `activeConns` budget.
-- Using different `providerId`s keeps capacity isolated, even if those providers point to the same upstream model name. For example, `glm` and `zai_glm` are tracked separately even if both use `"model": "glm-4"`.
-- Capacity is not keyed by route name and is not merged automatically by `providers[*].model`.
+- 如果多个 pool 复用同一个 provider ID，就会共享同一份连接池。例如 `haiku-primary` 和 `sonnet-primary` 都引用 `glm` 时，会共享同一个 `activeConns` 预算。
+- 如果使用不同的 provider ID，就会分开统计容量。即使两个 provider 最终都指向同一个上游模型名，也不会自动合并。例如 `glm` 和 `zai_glm` 即使都配置成 `"model": "glm-4"`，仍然分别计数。
+- 容量统计既不是按 route 名称，也不会按 `providers[*].model` 自动合并。
 
-### Configuration
+### 配置
 
 ```json
 {
@@ -195,7 +193,7 @@ Load balancing capacity is keyed by the `providerId`, which is the same ID used 
 }
 ```
 
-If you want the same upstream family to use separate capacity pools, give them different provider IDs:
+如果你希望同一类上游模型使用彼此独立的容量池，就给它们不同的 provider ID：
 
 ```json
 {
@@ -206,194 +204,189 @@ If you want the same upstream family to use separate capacity pools, give them d
 }
 ```
 
-### How it works
+### 工作原理
 
-1. A detector resolves a route key such as `haiku` or `sonnet`
-2. The router reads `routes.<key>` and chooses either a direct provider or a named pool
-3. If the route points to a pool, the pool selects the first provider where `activeConns < maxConns`
-4. If all providers in a pool are at capacity, it **fail-opens** to the first provider (no request dropped)
-5. `activeConns` is tracked by provider ID, so reusing the same provider ID in multiple pools shares the same live count
-6. Connection cleanup uses an **once-guard** to prevent double-decrement
+1. detector 先解析出 route key，例如 `haiku` 或 `sonnet`
+2. 路由器读取 `routes.<key>`，决定走单 provider 还是命名 pool
+3. 如果 route 指向 pool，就按顺序检查该 pool 的 providers
+4. 选择第一个 `activeConnections < maxConns` 的 provider
+5. pool 里所有 provider 满载时，**fail-open** 使用第一个 provider（不丢弃请求）
+6. `activeConns` 按 provider ID 统计，因此多个 pool 复用同一个 provider ID 时会共享同一个实时计数
+7. 连接清理使用 **once-guard** 防止双重递减
 
-### Visibility
+### 可观测性
 
-When `loadBalancer.showProvider` is `true`:
-- **Response header**: `X-Router-Provider: deepseek-sonnet`
-- **SSE comment**: `: router_provider: deepseek-sonnet` (in streaming responses)
-- **Request logs**: `[a3k9f2][abc123] claude-sonnet-4-5 -> deepseek-chat [route=sonnet pool=sonnet-primary provider=deepseek-sonnet 2/5 active]`
-- **Health endpoint**: `/health` includes `routes` plus `loadBalancer.pools`. If multiple pools reuse the same provider ID, that shared `activeConns` value can appear in more than one pool view.
+`loadBalancer.showProvider` 为 `true` 时：
+- **响应头**：`X-Router-Provider: deepseek-sonnet`
+- **SSE 注释**：`: router_provider: deepseek-sonnet`（仅流式响应）
+- **请求日志**：`[a3k9f2][abc123] claude-sonnet-4-5 -> deepseek-chat [route=sonnet pool=sonnet-primary provider=deepseek-sonnet 2/5 active]`
+- **健康检查**：`/health` 返回 `routes` 和 `loadBalancer.pools`。如果多个 pool 复用了同一个 provider ID，同一个共享 `activeConns` 值可能会在多个 pool 视图里出现。
 
-### Config Validation
+### 配置校验
 
-The proxy validates LB config at startup and on hot-reload:
-- Every route must reference an existing provider or pool
-- Every pool provider must reference an existing provider config
-- Provider IDs must be unique within a pool
-- The same provider ID may appear in multiple pools when you want them to share one capacity pool
-- `maxConns` must be positive integers
-- Strategy must be known (`priority-fallback`)
-- Provider IDs cannot collide with route or pool keys
-- Pool IDs cannot collide with route keys
+代理在启动和热重载时校验 LB 配置：
+- Route 必须引用存在的 provider 或 pool
+- Pool 内的 provider 必须引用已定义的 provider config
+- 同一个 pool 内 Provider ID 不能重复
+- 不同 pool 之间允许复用同一个 Provider ID，以共享同一份容量池
+- `maxConns` 必须为正整数
+- Strategy 必须已知（`priority-fallback`）
+- Provider ID 不能与 route 或 pool key 同名
+- Pool ID 不能与 route key 同名
 
-### Provider Configuration
+### 支持的提供商
 
-| Field | Required | Description |
-|-------|----------|-------------|
-| `model` | No | Actual model name sent to provider (defaults to provider ID) |
-| `baseURL` | Yes | Provider API base URL |
-| `apiKey` | Yes | API key (supports `${ENV_VAR}` syntax) |
-| `maxTokens` | No | Cap for `max_tokens` in requests |
+只要提供商兼容 Anthropic API 格式，就可以直接使用。常见配置：
 
-### Environment Variables in Config
+| 提供商 | baseURL 示例 |
+|--------|-------------|
+| Anthropic | `https://api.anthropic.com/v1` |
+| 智谱 GLM | `https://open.bigmodel.cn/api/anthropic` |
+| DeepSeek | `https://api.deepseek.com/anthropic` |
+| 阿里 Qwen | `https://dashscope.aliyuncs.com/apps/anthropic` |
 
-Use `${ENV_VAR}` or `$ENV_VAR` syntax to reference environment variables:
+### Provider 配置字段
 
-```json
-{
-  "apiKey": "${MY_PROVIDER_API_KEY}",
-  "baseURL": "$PROVIDER_BASE_URL"
-}
-```
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `model` | 否 | 实际发送给上游的模型名，默认等于 provider ID |
+| `baseURL` | 是 | 上游 API 基础地址 |
+| `apiKey` | 是 | API Key，支持 `${ENV_VAR}` / `$ENV_VAR` |
+| `maxTokens` | 否 | 请求中 `max_tokens` 的上限 |
 
-### Route Keys
+### Route Key
 
-| Rule | Key | Description |
-|------|-----|-------------|
-| Default | `default` | Fallback when no detector matches |
-| Image | `image` | Routes requests containing image content |
-| Haiku | `haiku` | Routes when model ID contains "haiku" |
-| Sonnet | `sonnet` | Routes when model ID contains "sonnet" |
-| Opus | `opus` | Routes when model ID contains "opus" |
+| 规则 | Key | 说明 |
+|------|-----|------|
+| Default | `default` | 所有 detector 都未命中时的兜底 |
+| Image | `image` | 检测到图片内容时走的 route |
+| Haiku | `haiku` | 请求模型名包含 `haiku` |
+| Sonnet | `sonnet` | 请求模型名包含 `sonnet` |
+| Opus | `opus` | 请求模型名包含 `opus` |
 
-## Scenario Detectors
+## 场景检测器
 
-Built-in detectors run in priority order (lower = higher priority):
+| 优先级 | 检测器 | 触发条件 |
+|--------|--------|---------|
+| 0 | **explicit** | 请求中包含逗号分隔的模型 ID |
+| 5 | **image** | 消息中包含图片内容 |
+| 8 | **modelFamily** | 模型 ID 包含 haiku / sonnet / opus 关键字 |
 
-| Priority | Detector | Trigger |
-|----------|----------|---------|
-| 0 | **explicit** | Comma-separated model ID in request (`model: "original,custom-model"`) |
-| 5 | **image** | Image or image_url content in recent messages |
-| 8 | **modelFamily** | Model ID contains haiku/sonnet/opus keyword |
+所有 detector 检查完后，代理还会尝试：
 
-After all detectors, the router tries:
-1. **Direct lookup**: `body.model` as a key in `providers` config
-2. **Default fallback**: `routes.default`
+1. 直接把 `body.model` 当成 `providers` 里的 key 查找
+2. 如果仍未命中，则使用 `routes.default`
 
-## Custom Scenarios
+## 自定义场景
 
-Create `~/.claude-custom-scenarios.mjs` (or set `$ROUTER_SCENARIOS_PATH`) to add your own detectors:
+创建 `~/.claude-custom-scenarios.mjs`（或设置 `$ROUTER_SCENARIOS_PATH`）添加自定义检测器：
 
 ```javascript
 export const detectors = [
   {
-    name: 'coding',
-    priority: 15,
+    name: 'coding',        // 检测器名称
+    priority: 15,           // 优先级（越小越先检查）
     detect(body, ctx) {
-      // body: Anthropic API request body
+      // body: API 请求体
       // ctx: { tokenCount, config }
       if (!ctx.config.routes.coding) return null;
       const hasCodeTools = (body.tools || []).some(t =>
         t.name === 'Read' || t.name === 'Edit'
       );
-      // Return route KEY, not provider ID
+      // 返回 route KEY，而不是 provider ID
       return hasCodeTools ? 'coding' : null;
     },
   },
 ];
 ```
 
-Then add the router rule:
+然后在配置中添加路由规则：
 
 ```json
 {
   "routes": {
-    "coding": { "provider": "my-coding-provider" }
+    "coding": { "provider": "coding-provider-id" }
   }
 }
 ```
 
-> **Note**: Custom detectors should return the **route key** (e.g., `'coding'`), not the provider ID. The proxy resolves the route to either a direct provider or a named pool. Returning provider IDs directly still works via direct lookup, but returning the route key is the recommended approach.
+> **注意**：自定义检测器应返回 **route key**（如 `'coding'`），而非 provider ID。代理会把 route 解析为单 provider 或命名 pool。直接返回 provider ID 仍然可以通过 direct lookup 生效，但推荐返回 route key。
 
-See [`examples/custom-scenarios.mjs`](examples/custom-scenarios.mjs) for more examples.
+完整示例见 [`examples/custom-scenarios.mjs`](examples/custom-scenarios.mjs)。
 
-## CLI Commands
+## CLI 命令
 
 ```bash
-# Start proxy (foreground)
-node src/custom-model-proxy.mjs
-
-# Stop running proxy
-node src/custom-model-proxy.mjs --stop
-
-# Check status
-node src/custom-model-proxy.mjs --status
+node src/custom-model-proxy.mjs          # 启动代理
+node src/custom-model-proxy.mjs --stop   # 停止代理
+node src/custom-model-proxy.mjs --status # 查看状态
 ```
 
-## Environment Variables
+## 环境变量
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `ROUTER_CONFIG_PATH` | `~/.claude-custom-router.json` | Path to config file |
-| `ROUTER_SCENARIOS_PATH` | `~/.claude-custom-scenarios.mjs` | Path to custom scenarios module |
-| `ROUTER_PORT` | From config (8082) | Override proxy port |
-| `ROUTER_LOG_DIR` | `~/.claude-custom-router.d/logs` | Directory for log files |
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `ROUTER_CONFIG_PATH` | `~/.claude-custom-router.json` | 配置文件路径 |
+| `ROUTER_SCENARIOS_PATH` | `~/.claude-custom-scenarios.mjs` | 自定义场景模块路径 |
+| `ROUTER_PORT` | 配置文件中的端口（8082） | 覆盖代理端口 |
+| `ROUTER_LOG_DIR` | `~/.claude-custom-router.d/logs` | 日志目录 |
 
-## API Endpoints
+## API 端点
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/health` | GET | Health check (returns providers, routes, pool status, debug status) |
-| `/v1/models` | GET | List configured providers in Anthropic model-list format |
-| `/v1/messages` | POST | Proxy endpoint (routes to appropriate model) |
-| Other paths | Any | Forwarded to default model's base URL |
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/health` | GET | 健康检查（返回 providers、routes、pool 状态、debug 状态） |
+| `/v1/models` | GET | 以 Anthropic 模型列表格式返回已配置的 providers |
+| `/v1/messages` | POST | 代理端点（路由到对应的模型） |
+| 其他路径 | Any | 转发到默认模型的 base URL |
 
-## Hot Reload
+## 热重载
 
-The proxy watches `~/.claude-custom-router.json` for changes and reloads automatically. No restart needed.
+代理会监听配置文件变更并自动重载，无需重启。
 
-## Debug Mode
+## 调试模式
 
-Set `"debug": true` in config to enable request/response dumps:
+在配置中设置 `"debug": true` 启用请求/响应转储：
 
 ```
 ~/.claude-custom-router.d/logs/debug/
   └── <session-id>/
-      ├── <timestamp>_<reqid>_<model>_req.json       # Original request
-      ├── <timestamp>_<reqid>_<model>_processed.json # Routed request
-      └── <timestamp>_<reqid>_<model>_res.txt        # Response
+      ├── <timestamp>_<reqid>_<model>_req.json        # 原始请求
+      ├── <timestamp>_<reqid>_<model>_processed.json  # 路由后请求
+      └── <timestamp>_<reqid>_<model>_res.txt         # 响应内容
 ```
 
-- Request log prefixes include the generated request ID and the first 6 characters of `session_id` when available: `[reqid][session6]`.
-- Debug dumps are grouped by `session_id`; when no session is present, the proxy falls back to today's date (`YYYYMMDD`).
-- Upstream non-2xx responses are logged with their decoded response body (truncated for very large bodies).
+- 请求日志前缀会带上生成的 `reqid`，以及 `session_id` 存在时的前 6 位：`[reqid][session6]`。
+- Debug 转储按 `session_id` 分目录；如果请求里没有 session，则回退到当天日期（`YYYYMMDD`）。
+- 上游返回非 2xx 时，代理会把解码后的响应体写入日志；超长内容会被截断。
 
-## Integration with Claude Code
+## 与 Claude Code 集成
 
-Add to your shell profile (`.zshrc` / `.bashrc`):
+在 shell 配置文件（`.zshrc` / `.bashrc`）中添加：
 
 ```bash
 export ANTHROPIC_BASE_URL="http://127.0.0.1:8082"
 ```
 
-Or use it per-session:
+或者单次会话使用：
 
 ```bash
 ANTHROPIC_BASE_URL="http://127.0.0.1:8082" claude
 ```
 
-## Running Tests
+## 运行测试
 
 ```bash
 npm test
 ```
 
-Uses Node.js built-in test runner — zero dependencies.
+使用 Node.js 内置测试运行器，零依赖。
 
-## Requirements
+## 系统要求
 
 - Node.js >= 18.0.0
-- No npm dependencies
+- 无需 npm 依赖
 
-## License
+## 许可证
 
 MIT
