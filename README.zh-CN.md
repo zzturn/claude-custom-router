@@ -77,21 +77,43 @@ curl http://127.0.0.1:8082/health
 {
   "port": 8082,
   "debug": false,
-  "Router": {
-    "default": "默认模型ID",
-    "longContext": "长上下文模型ID",
-    "longContextThreshold": 60000,
-    "image": "视觉模型ID",
-    "background": "轻量模型ID",
-    "think": "推理模型ID",
-    "webSearch": "搜索模型ID"
-  },
-  "models": {
-    "模型ID": {
-      "name": "实际模型名称",
+  "upstreamTimeoutMs": 360000,
+  "providers": {
+    "default-provider": {
+      "model": "实际模型名称",
       "baseURL": "https://api.provider.com/v1",
       "apiKey": "${环境变量名}",
       "maxTokens": 8192
+    },
+    "glm": {
+      "model": "glm-4",
+      "baseURL": "https://open.bigmodel.cn/api/anthropic",
+      "apiKey": "${GLM_API_KEY}"
+    },
+    "qwen-sonnet": {
+      "model": "qwen-plus",
+      "baseURL": "https://dashscope.aliyuncs.com/apps/anthropic",
+      "apiKey": "${QWEN_API_KEY}"
+    }
+  },
+  "pools": {
+    "sonnet-primary": {
+      "strategy": "priority-fallback",
+      "providers": [
+        { "provider": "glm", "maxConns": 5 },
+        { "provider": "qwen-sonnet", "maxConns": 3 }
+      ]
+    }
+  },
+  "routes": {
+    "default": { "provider": "default-provider" },
+    "image": { "provider": "default-provider" },
+    "haiku": { "provider": "default-provider" },
+    "sonnet": { "pool": "sonnet-primary" },
+    "opus": { "provider": "default-provider" }
+  },
+  "loadBalancer": {
+    "showProvider": true
     }
   }
 }
@@ -108,12 +130,16 @@ curl http://127.0.0.1:8082/health
 }
 ```
 
-### Router 值：字符串 vs 对象
+### 配置分层
 
-每个 Router 值可以是：
+- `routes`：业务入口，比如 `default`、`haiku`、`sonnet`、`opus`、`image`
+- `pools`：可复用的负载均衡池
+- `providers`：具体的上游 endpoint、账号和实际发给上游的模型名
 
-- **字符串**（单提供商）：`"sonnet": "sonnet-provider"` — 所有匹配请求路由到一个提供商
-- **对象**（负载均衡组）：见下方 [负载均衡](#负载均衡)
+每个 route 必须二选一：
+
+- `{ "provider": "provider-id" }`
+- `{ "pool": "pool-id" }`
 
 ## 负载均衡
 
@@ -123,55 +149,91 @@ curl http://127.0.0.1:8082/health
 
 默认策略按配置顺序检查提供商，选择第一个有可用容量的（`activeConns < maxConns`）。适合有主力提供商 + 1-2 个 backup 的场景——主力处理大部分流量，backup 仅在主力饱和时启用。
 
+### 容量统计单位
+
+负载均衡的容量统计单位是 `providerId`，也就是 `pools.<pool>.providers[*].provider` 使用的那个 ID。
+
+- 如果多个 pool 复用同一个 provider ID，就会共享同一份连接池。例如 `haiku-primary` 和 `sonnet-primary` 都引用 `glm` 时，会共享同一个 `activeConns` 预算。
+- 如果使用不同的 provider ID，就会分开统计容量。即使两个 provider 最终都指向同一个上游模型名，也不会自动合并。例如 `glm` 和 `zai_glm` 即使都配置成 `"model": "glm-4"`，仍然分别计数。
+- 容量统计既不是按 route 名称，也不会按 `providers[*].model` 自动合并。
+
 ### 配置
 
 ```json
 {
-  "Router": {
-    "sonnet": {
+  "providers": {
+    "glm": { "model": "glm-4", "baseURL": "...", "apiKey": "..." },
+    "haiku-provider": { "model": "haiku-model", "baseURL": "...", "apiKey": "..." },
+    "deepseek-sonnet": { "model": "deepseek-chat", "baseURL": "...", "apiKey": "..." },
+    "qwen-sonnet": { "model": "qwen-plus", "baseURL": "...", "apiKey": "..." }
+  },
+  "pools": {
+    "haiku-primary": {
       "strategy": "priority-fallback",
       "providers": [
-        { "id": "deepseek-sonnet", "maxConns": 5 },
-        { "id": "qwen-sonnet",     "maxConns": 3 },
-        { "id": "glm-sonnet",      "maxConns": 3 }
+        { "provider": "glm", "maxConns": 3 },
+        { "provider": "haiku-provider", "maxConns": 5 }
+      ]
+    },
+    "sonnet-primary": {
+      "strategy": "priority-fallback",
+      "providers": [
+        { "provider": "glm", "maxConns": 3 },
+        { "provider": "deepseek-sonnet", "maxConns": 5 },
+        { "provider": "qwen-sonnet", "maxConns": 3 }
       ]
     }
   },
-  "LoadBalancer": {
-    "showProvider": true
+  "routes": {
+    "haiku": { "pool": "haiku-primary" },
+    "sonnet": { "pool": "sonnet-primary" }
   },
-  "models": {
-    "deepseek-sonnet": { "name": "deepseek-chat", "baseURL": "...", "apiKey": "..." },
-    "qwen-sonnet":     { "name": "qwen-plus",     "baseURL": "...", "apiKey": "..." },
-    "glm-sonnet":      { "name": "glm-4",         "baseURL": "...", "apiKey": "..." }
+  "loadBalancer": {
+    "showProvider": true
+  }
+}
+```
+
+如果你希望同一类上游模型使用彼此独立的容量池，就给它们不同的 provider ID：
+
+```json
+{
+  "providers": {
+    "glm": { "model": "glm-4", "baseURL": "...", "apiKey": "..." },
+    "zai_glm": { "model": "glm-4", "baseURL": "...", "apiKey": "..." }
   }
 }
 ```
 
 ### 工作原理
 
-1. 请求匹配 `sonnet` Router key 时，按顺序检查 providers
-2. 选择第一个 `activeConnections < maxConns` 的 provider
-3. 所有 provider 满载时，**fail-open** 使用第一个 provider（不丢弃请求）
-4. 活跃连接通过流生命周期事件（`close` / `error`）追踪
-5. 连接清理使用 **once-guard** 防止双重递减
+1. detector 先解析出 route key，例如 `haiku` 或 `sonnet`
+2. 路由器读取 `routes.<key>`，决定走单 provider 还是命名 pool
+3. 如果 route 指向 pool，就按顺序检查该 pool 的 providers
+4. 选择第一个 `activeConnections < maxConns` 的 provider
+5. pool 里所有 provider 满载时，**fail-open** 使用第一个 provider（不丢弃请求）
+6. `activeConns` 按 provider ID 统计，因此多个 pool 复用同一个 provider ID 时会共享同一个实时计数
+7. 连接清理使用 **once-guard** 防止双重递减
 
 ### 可观测性
 
-`LoadBalancer.showProvider` 为 `true` 时：
+`loadBalancer.showProvider` 为 `true` 时：
 - **响应头**：`X-Router-Provider: deepseek-sonnet`
 - **SSE 注释**：`: router_provider: deepseek-sonnet`（仅流式响应）
-- **请求日志**：`[a3k9f2][abc123] claude-sonnet-4-5 -> deepseek-chat [sonnet 2/5 active]`
-- **健康检查**：`/health` 返回 LB 组状态和活跃连接数
+- **请求日志**：`[a3k9f2][abc123] claude-sonnet-4-5 -> deepseek-chat [route=sonnet pool=sonnet-primary provider=deepseek-sonnet 2/5 active]`
+- **健康检查**：`/health` 返回 `routes` 和 `loadBalancer.pools`。如果多个 pool 复用了同一个 provider ID，同一个共享 `activeConns` 值可能会在多个 pool 视图里出现。
 
 ### 配置校验
 
 代理在启动和热重载时校验 LB 配置：
-- Provider ID 必须引用已定义的 model config
-- 同一组内 Provider ID 不能重复
+- Route 必须引用存在的 provider 或 pool
+- Pool 内的 provider 必须引用已定义的 provider config
+- 同一个 pool 内 Provider ID 不能重复
+- 不同 pool 之间允许复用同一个 Provider ID，以共享同一份容量池
 - `maxConns` 必须为正整数
 - Strategy 必须已知（`priority-fallback`）
-- Model config ID 不能与 Router key 同名
+- Provider ID 不能与 route 或 pool key 同名
+- Pool ID 不能与 route key 同名
 
 ### 支持的提供商
 
@@ -184,25 +246,37 @@ curl http://127.0.0.1:8082/health
 | DeepSeek | `https://api.deepseek.com/anthropic` |
 | 阿里 Qwen | `https://dashscope.aliyuncs.com/apps/anthropic` |
 
+### Provider 配置字段
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `model` | 否 | 实际发送给上游的模型名，默认等于 provider ID |
+| `baseURL` | 是 | 上游 API 基础地址 |
+| `apiKey` | 是 | API Key，支持 `${ENV_VAR}` / `$ENV_VAR` |
+| `maxTokens` | 否 | 请求中 `max_tokens` 的上限 |
+
+### Route Key
+
+| 规则 | Key | 说明 |
+|------|-----|------|
+| Default | `default` | 所有 detector 都未命中时的兜底 |
+| Image | `image` | 检测到图片内容时走的 route |
+| Haiku | `haiku` | 请求模型名包含 `haiku` |
+| Sonnet | `sonnet` | 请求模型名包含 `sonnet` |
+| Opus | `opus` | 请求模型名包含 `opus` |
+
 ## 场景检测器
 
 | 优先级 | 检测器 | 触发条件 |
 |--------|--------|---------|
 | 0 | **explicit** | 请求中包含逗号分隔的模型 ID |
 | 5 | **image** | 消息中包含图片内容 |
-| 10 | **longContext** | 估算 token 数超过阈值（默认 60k） |
-| 20 | **subagent** | system prompt 中包含 `<CCR-SUBAGENT-MODEL>` 标签 |
-| 30 | **background** | 检测到 Haiku 模型请求 |
-| 40 | **webSearch** | 请求包含 `web_search` 类型工具 |
-| 50 | **think** | 请求包含 `thinking` 参数 |
+| 8 | **modelFamily** | 模型 ID 包含 haiku / sonnet / opus 关键字 |
 
-### 子代理模型指定
+所有 detector 检查完后，代理还会尝试：
 
-在子代理的 system prompt 中嵌入模型标签即可指定使用的模型：
-
-```
-<CCR-SUBAGENT-MODEL>my-model</CCR-SUBAGENT-MODEL>你是一个有用的助手...
-```
+1. 直接把 `body.model` 当成 `providers` 里的 key 查找
+2. 如果仍未命中，则使用 `routes.default`
 
 ## 自定义场景
 
@@ -216,11 +290,11 @@ export const detectors = [
     detect(body, ctx) {
       // body: API 请求体
       // ctx: { tokenCount, config }
-      if (!ctx.config.Router.coding) return null;
+      if (!ctx.config.routes.coding) return null;
       const hasCodeTools = (body.tools || []).some(t =>
         t.name === 'Read' || t.name === 'Edit'
       );
-      // 返回 Router KEY，而不是 model config ID
+      // 返回 route KEY，而不是 provider ID
       return hasCodeTools ? 'coding' : null;
     },
   },
@@ -231,13 +305,13 @@ export const detectors = [
 
 ```json
 {
-  "Router": {
-    "coding": "coding-model-id"
+  "routes": {
+    "coding": { "provider": "coding-provider-id" }
   }
 }
 ```
 
-> **注意**：自定义检测器应返回 **Router key**（如 `'coding'`），而非 model config ID。代理会将 key 解析为字符串提供商或 LB 组对象。返回 model config ID 仍然可以通过 fallback 正常工作，但推荐返回 Router key。
+> **注意**：自定义检测器应返回 **route key**（如 `'coding'`），而非 provider ID。代理会把 route 解析为单 provider 或命名 pool。直接返回 provider ID 仍然可以通过 direct lookup 生效，但推荐返回 route key。
 
 完整示例见 [`examples/custom-scenarios.mjs`](examples/custom-scenarios.mjs)。
 

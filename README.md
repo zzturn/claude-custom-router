@@ -75,50 +75,72 @@ Config file: `~/.claude-custom-router.json` (or `$ROUTER_CONFIG_PATH`)
 {
   "port": 8082,
   "debug": false,
-  "Router": {
-    "default": "my-default-model",
-    "image": "vision-model",
-    "haiku": "haiku-provider",
-    "sonnet": "sonnet-provider",
-    "opus": "opus-provider"
-  },
-  "models": {
-    "my-default-model": {
-      "name": "actual-model-name",
+  "upstreamTimeoutMs": 360000,
+  "providers": {
+    "default-provider": {
+      "model": "actual-model-name",
       "baseURL": "https://api.provider.com/v1",
       "apiKey": "${MY_API_KEY}",
       "maxTokens": 8192
     },
     "haiku-provider": {
-      "name": "haiku-model-name",
+      "model": "haiku-model-name",
       "baseURL": "https://api.haiku-provider.com/v1",
       "apiKey": "${HAIKU_API_KEY}"
     },
-    "sonnet-provider": {
-      "name": "sonnet-model-name",
-      "baseURL": "https://api.sonnet-provider.com/v1",
-      "apiKey": "${SONNET_API_KEY}"
+    "glm": {
+      "model": "glm-4",
+      "baseURL": "https://open.bigmodel.cn/api/anthropic",
+      "apiKey": "${GLM_API_KEY}"
+    },
+    "qwen-sonnet": {
+      "model": "qwen-plus",
+      "baseURL": "https://dashscope.aliyuncs.com/apps/anthropic",
+      "apiKey": "${QWEN_API_KEY}"
     },
     "opus-provider": {
-      "name": "opus-model-name",
+      "model": "opus-model-name",
       "baseURL": "https://api.opus-provider.com/v1",
       "apiKey": "${OPUS_API_KEY}"
     },
-    "vision-model": {
-      "name": "vision-model-name",
+    "vision-provider": {
+      "model": "vision-model-name",
       "baseURL": "https://api.provider.com/v1",
       "apiKey": "${API_KEY}"
     }
+  },
+  "pools": {
+    "sonnet-primary": {
+      "strategy": "priority-fallback",
+      "providers": [
+        { "provider": "glm", "maxConns": 5 },
+        { "provider": "qwen-sonnet", "maxConns": 3 }
+      ]
+    }
+  },
+  "routes": {
+    "default": { "provider": "default-provider" },
+    "image": { "provider": "vision-provider" },
+    "haiku": { "provider": "haiku-provider" },
+    "sonnet": { "pool": "sonnet-primary" },
+    "opus": { "provider": "opus-provider" }
+  },
+  "loadBalancer": {
+    "showProvider": true
   }
 }
 ```
 
-### Router values: string vs object
+### Configuration Layers
 
-Each Router value can be either:
+- `routes`: business-facing entrypoints such as `default`, `haiku`, `sonnet`, `opus`, `image`
+- `pools`: named load-balancing pools that can be reused by multiple routes
+- `providers`: concrete upstream endpoints plus the actual model name sent upstream
 
-- **String** (single provider): `"sonnet": "sonnet-provider"` — routes all matching requests to one provider
-- **Object** (load balanced group): see [Load Balancing](#load-balancing) below
+Each route must choose exactly one target:
+
+- `{ "provider": "provider-id" }`
+- `{ "pool": "pool-id" }`
 
 ## Load Balancing
 
@@ -128,61 +150,96 @@ When running Claude Code agent teams, multiple agents make concurrent LLM API ca
 
 The default strategy checks providers in configured order and selects the first one with available capacity (`activeConns < maxConns`). This is ideal when you have a primary provider and 1-2 backups — the primary handles most traffic, and backups only activate when the primary is saturated.
 
+### Capacity Unit
+
+Load balancing capacity is keyed by the `providerId`, which is the same ID used in `pools.<pool>.providers[*].provider`.
+
+- Reusing the same `providerId` across multiple pools shares one connection pool. For example, if both `haiku-primary` and `sonnet-primary` reference `glm`, they share the same `activeConns` budget.
+- Using different `providerId`s keeps capacity isolated, even if those providers point to the same upstream model name. For example, `glm` and `zai_glm` are tracked separately even if both use `"model": "glm-4"`.
+- Capacity is not keyed by route name and is not merged automatically by `providers[*].model`.
+
 ### Configuration
 
 ```json
 {
-  "Router": {
-    "sonnet": {
+  "providers": {
+    "glm": { "model": "glm-4", "baseURL": "...", "apiKey": "..." },
+    "haiku-provider": { "model": "haiku-model", "baseURL": "...", "apiKey": "..." },
+    "deepseek-sonnet": { "model": "deepseek-chat", "baseURL": "...", "apiKey": "..." },
+    "qwen-sonnet": { "model": "qwen-plus", "baseURL": "...", "apiKey": "..." }
+  },
+  "pools": {
+    "haiku-primary": {
       "strategy": "priority-fallback",
       "providers": [
-        { "id": "deepseek-sonnet", "maxConns": 5 },
-        { "id": "qwen-sonnet",     "maxConns": 3 },
-        { "id": "glm-sonnet",      "maxConns": 3 }
+        { "provider": "glm", "maxConns": 3 },
+        { "provider": "haiku-provider", "maxConns": 5 }
+      ]
+    },
+    "sonnet-primary": {
+      "strategy": "priority-fallback",
+      "providers": [
+        { "provider": "glm", "maxConns": 3 },
+        { "provider": "deepseek-sonnet", "maxConns": 5 },
+        { "provider": "qwen-sonnet", "maxConns": 3 }
       ]
     }
   },
-  "LoadBalancer": {
-    "showProvider": true
+  "routes": {
+    "haiku": { "pool": "haiku-primary" },
+    "sonnet": { "pool": "sonnet-primary" }
   },
-  "models": {
-    "deepseek-sonnet": { "name": "deepseek-chat", "baseURL": "...", "apiKey": "..." },
-    "qwen-sonnet":     { "name": "qwen-plus",     "baseURL": "...", "apiKey": "..." },
-    "glm-sonnet":      { "name": "glm-4",         "baseURL": "...", "apiKey": "..." }
+  "loadBalancer": {
+    "showProvider": true
+  }
+}
+```
+
+If you want the same upstream family to use separate capacity pools, give them different provider IDs:
+
+```json
+{
+  "providers": {
+    "glm": { "model": "glm-4", "baseURL": "...", "apiKey": "..." },
+    "zai_glm": { "model": "glm-4", "baseURL": "...", "apiKey": "..." }
   }
 }
 ```
 
 ### How it works
 
-1. When a request matches the `sonnet` Router key, the proxy checks providers in order
-2. It selects the first provider where `activeConnections < maxConns`
-3. If all providers are at capacity, it **fail-opens** to the first provider (no request dropped)
-4. Active connections are tracked via stream lifecycle events (`close` / `error`)
-5. Connection cleanup uses an **once-guard** to prevent double-decrement
+1. A detector resolves a route key such as `haiku` or `sonnet`
+2. The router reads `routes.<key>` and chooses either a direct provider or a named pool
+3. If the route points to a pool, the pool selects the first provider where `activeConns < maxConns`
+4. If all providers in a pool are at capacity, it **fail-opens** to the first provider (no request dropped)
+5. `activeConns` is tracked by provider ID, so reusing the same provider ID in multiple pools shares the same live count
+6. Connection cleanup uses an **once-guard** to prevent double-decrement
 
 ### Visibility
 
-When `LoadBalancer.showProvider` is `true`:
+When `loadBalancer.showProvider` is `true`:
 - **Response header**: `X-Router-Provider: deepseek-sonnet`
 - **SSE comment**: `: router_provider: deepseek-sonnet` (in streaming responses)
-- **Request logs**: `[a3k9f2][abc123] claude-sonnet-4-5 -> deepseek-chat [sonnet 2/5 active]`
-- **Health endpoint**: `/health` includes LB group status with active connection counts
+- **Request logs**: `[a3k9f2][abc123] claude-sonnet-4-5 -> deepseek-chat [route=sonnet pool=sonnet-primary provider=deepseek-sonnet 2/5 active]`
+- **Health endpoint**: `/health` includes `routes` plus `loadBalancer.pools`. If multiple pools reuse the same provider ID, that shared `activeConns` value can appear in more than one pool view.
 
 ### Config Validation
 
 The proxy validates LB config at startup and on hot-reload:
-- All provider IDs must reference existing model configs
-- Provider IDs must be unique within a group
+- Every route must reference an existing provider or pool
+- Every pool provider must reference an existing provider config
+- Provider IDs must be unique within a pool
+- The same provider ID may appear in multiple pools when you want them to share one capacity pool
 - `maxConns` must be positive integers
 - Strategy must be known (`priority-fallback`)
-- Model config IDs cannot collide with Router keys
+- Provider IDs cannot collide with route or pool keys
+- Pool IDs cannot collide with route keys
 
-### Model Configuration
+### Provider Configuration
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `name` | No | Actual model name sent to provider (defaults to model ID) |
+| `model` | No | Actual model name sent to provider (defaults to provider ID) |
 | `baseURL` | Yes | Provider API base URL |
 | `apiKey` | Yes | API key (supports `${ENV_VAR}` syntax) |
 | `maxTokens` | No | Cap for `max_tokens` in requests |
@@ -198,7 +255,7 @@ Use `${ENV_VAR}` or `$ENV_VAR` syntax to reference environment variables:
 }
 ```
 
-### Router Rules
+### Route Keys
 
 | Rule | Key | Description |
 |------|-----|-------------|
@@ -219,8 +276,8 @@ Built-in detectors run in priority order (lower = higher priority):
 | 8 | **modelFamily** | Model ID contains haiku/sonnet/opus keyword |
 
 After all detectors, the router tries:
-1. **Direct lookup**: `body.model` as a key in `models` config
-2. **Default fallback**: `Router.default`
+1. **Direct lookup**: `body.model` as a key in `providers` config
+2. **Default fallback**: `routes.default`
 
 ## Custom Scenarios
 
@@ -234,11 +291,11 @@ export const detectors = [
     detect(body, ctx) {
       // body: Anthropic API request body
       // ctx: { tokenCount, config }
-      if (!ctx.config.Router.coding) return null;
+      if (!ctx.config.routes.coding) return null;
       const hasCodeTools = (body.tools || []).some(t =>
         t.name === 'Read' || t.name === 'Edit'
       );
-      // Return Router KEY, not model config ID
+      // Return route KEY, not provider ID
       return hasCodeTools ? 'coding' : null;
     },
   },
@@ -249,13 +306,13 @@ Then add the router rule:
 
 ```json
 {
-  "Router": {
-    "coding": "my-coding-model"
+  "routes": {
+    "coding": { "provider": "my-coding-provider" }
   }
 }
 ```
 
-> **Note**: Custom detectors should return the **Router key** (e.g., `'coding'`), not the model config ID. The proxy resolves the key to either a string provider or a LB group object. Detectors returning model config IDs still work via fallback, but returning the Router key is the recommended approach.
+> **Note**: Custom detectors should return the **route key** (e.g., `'coding'`), not the provider ID. The proxy resolves the route to either a direct provider or a named pool. Returning provider IDs directly still works via direct lookup, but returning the route key is the recommended approach.
 
 See [`examples/custom-scenarios.mjs`](examples/custom-scenarios.mjs) for more examples.
 
@@ -285,8 +342,8 @@ node src/custom-model-proxy.mjs --status
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/health` | GET | Health check (returns models, router config, LB status, debug status) |
-| `/v1/models` | GET | List configured models (Anthropic API format) |
+| `/health` | GET | Health check (returns providers, routes, pool status, debug status) |
+| `/v1/models` | GET | List configured providers in Anthropic model-list format |
 | `/v1/messages` | POST | Proxy endpoint (routes to appropriate model) |
 | Other paths | Any | Forwarded to default model's base URL |
 

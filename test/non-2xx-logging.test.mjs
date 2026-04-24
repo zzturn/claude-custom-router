@@ -23,12 +23,12 @@ const ERROR_BODY = JSON.stringify({
 const TEST_CONFIG = {
   port: PROXY_PORT,
   debug: false,
-  Router: {
-    default: 'test-model',
+  routes: {
+    default: { provider: 'test-provider' },
   },
-  models: {
-    'test-model': {
-      name: 'test-model-name',
+  providers: {
+    'test-provider': {
+      model: 'test-model-name',
       baseURL: `http://127.0.0.1:${UPSTREAM_PORT}`,
       apiKey: 'test-key',
     },
@@ -96,7 +96,7 @@ describe('non-2xx upstream logging', () => {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        model: 'test-model',
+        model: 'test-provider',
         messages: [{ role: 'user', content: 'hi' }],
         max_tokens: 100,
       }),

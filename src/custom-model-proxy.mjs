@@ -48,7 +48,7 @@ import { homedir } from 'node:os';
 
 const HOME = homedir();
 
-/** @type {string} Path to model configuration file */
+/** @type {string} Path to router configuration file */
 const CONFIG_PATH = process.env.ROUTER_CONFIG_PATH || join(HOME, '.claude-custom-router.json');
 
 /** @type {string} Path to PID file for process management */
@@ -197,32 +197,45 @@ function createReqContext(body) {
 // ─── Config Management ────────────────────────────────────────────────────────
 
 /**
- * @typedef {Object} ModelConfig
- * @property {string} name - Actual model name sent to the provider
+ * @typedef {Object} ProviderConfig
+ * @property {string} model - Actual model name sent to the upstream provider
  * @property {string} baseURL - Provider API base URL
  * @property {string} apiKey - API key (resolved from env vars)
  * @property {number|null} maxTokens - Maximum output tokens cap
  */
 
 /**
- * @typedef {Object} RouterConfig
- * @property {string} [default] - Default model ID (fallback when no other match)
- * @property {string} [image] - Model for image/vision scenarios
- * @property {string} [haiku] - Model for Haiku family requests
- * @property {string} [sonnet] - Model for Sonnet family requests
- * @property {string} [opus] - Model for Opus family requests
+ * @typedef {Object} RouteConfig
+ * @property {string} [provider] - Direct provider target
+ * @property {string} [pool] - Load-balancing pool target
+ */
+
+/**
+ * @typedef {Object} PoolConfig
+ * @property {string} strategy - Pool strategy
+ * @property {Array<{provider: string, maxConns: number}>} providers - Pool members
  */
 
 /**
  * @typedef {Object} AppConfig
  * @property {number} port - Proxy port
  * @property {boolean} debug - Debug mode flag
- * @property {Record<string, ModelConfig>} models - Available model configurations
- * @property {RouterConfig} Router - Scenario routing rules
+ * @property {Record<string, ProviderConfig>} providers - Available upstream provider configurations
+ * @property {Record<string, PoolConfig>} pools - Named load-balancing pools
+ * @property {Record<string, RouteConfig>} routes - Scenario routing rules
+ * @property {{ showProvider?: boolean }} loadBalancer - LB visibility settings
  */
 
 /** @type {AppConfig} */
-let config = { port: DEFAULT_PORT, models: {}, Router: {}, debug: false, upstreamTimeoutMs: 5 * 60 * 1000 };
+let config = {
+  port: DEFAULT_PORT,
+  providers: {},
+  pools: {},
+  routes: {},
+  loadBalancer: {},
+  debug: false,
+  upstreamTimeoutMs: 5 * 60 * 1000,
+};
 
 /**
  * Resolves environment variable references in string values.
@@ -255,7 +268,8 @@ function resolveEnvVar(value) {
 
 /** Reloads configuration from disk and logs changes */
 function reloadConfig() {
-  const oldRouter = JSON.stringify(config.Router);
+  const oldRoutes = JSON.stringify(config.routes);
+  const oldPools = JSON.stringify(config.pools);
   try {
     const raw = readFileSync(CONFIG_PATH, 'utf8');
     const parsed = JSON.parse(raw);
@@ -267,71 +281,101 @@ function reloadConfig() {
     }
     config.port = parsedPort;
     config.debug = parsed.debug || false;
-    config.Router = parsed.Router || {};
-    config.LoadBalancer = parsed.LoadBalancer || {};
+    config.routes = parsed.routes || {};
+    config.pools = parsed.pools || {};
+    config.loadBalancer = parsed.loadBalancer || {};
     config.upstreamTimeoutMs = parsed.upstreamTimeoutMs || 5 * 60 * 1000;
 
-    config.models = {};
-    for (const [id, m] of Object.entries(parsed.models || {})) {
-      config.models[id] = {
-        name: m.name || id,
-        baseURL: resolveEnvVar(m.baseURL),
-        apiKey: resolveEnvVar(m.apiKey),
-        maxTokens: m.maxTokens || null,
+    config.providers = {};
+    for (const [id, provider] of Object.entries(parsed.providers || {})) {
+      config.providers[id] = {
+        model: provider.model || id,
+        baseURL: resolveEnvVar(provider.baseURL),
+        apiKey: resolveEnvVar(provider.apiKey),
+        maxTokens: provider.maxTokens || null,
       };
     }
 
-    // Validate: reject model config IDs that collide with Router keys
-    for (const modelId of Object.keys(config.models)) {
-      if (modelId in config.Router) {
-        throw new Error(`Config collision: model ID "${modelId}" conflicts with Router key. Router keys are reserved.`);
+    const providerIds = Object.keys(config.providers);
+    const poolIds = Object.keys(config.pools);
+    const routeIds = Object.keys(config.routes);
+
+    for (const providerId of providerIds) {
+      if (providerId in config.routes) {
+        throw new Error(`Config collision: provider ID "${providerId}" conflicts with route key`);
+      }
+      if (providerId in config.pools) {
+        throw new Error(`Config collision: provider ID "${providerId}" conflicts with pool key`);
       }
     }
 
-    // Validate LB groups
+    for (const poolId of poolIds) {
+      if (poolId in config.routes) {
+        throw new Error(`Config collision: pool ID "${poolId}" conflicts with route key`);
+      }
+    }
+
     const knownStrategies = Object.keys(strategies);
-    const validGroupKeys = new Set();
-    for (const [key, entry] of Object.entries(config.Router)) {
-      if (typeof entry === 'object' && entry !== null) {
-        if (!entry.strategy) throw new Error(`LB group "${key}" missing "strategy" field`);
-        if (!knownStrategies.includes(entry.strategy)) {
-          throw new Error(`LB group "${key}" has unknown strategy "${entry.strategy}". Available: ${knownStrategies.join(', ')}`);
+    for (const [poolId, pool] of Object.entries(config.pools)) {
+      if (!pool || typeof pool !== 'object' || Array.isArray(pool)) {
+        throw new Error(`Pool "${poolId}" must be an object`);
+      }
+      if (!pool.strategy) throw new Error(`Pool "${poolId}" missing "strategy" field`);
+      if (!knownStrategies.includes(pool.strategy)) {
+        throw new Error(`Pool "${poolId}" has unknown strategy "${pool.strategy}". Available: ${knownStrategies.join(', ')}`);
+      }
+      if (!Array.isArray(pool.providers) || pool.providers.length === 0) {
+        throw new Error(`Pool "${poolId}" must have a non-empty "providers" array`);
+      }
+      const seenProviders = new Set();
+      for (const providerRef of pool.providers) {
+        if (!providerRef.provider) throw new Error(`Pool "${poolId}" has a provider entry missing "provider"`);
+        if (!config.providers[providerRef.provider]) throw new Error(`Pool "${poolId}" references unknown provider "${providerRef.provider}"`);
+        if (seenProviders.has(providerRef.provider)) throw new Error(`Pool "${poolId}" has duplicate provider "${providerRef.provider}"`);
+        seenProviders.add(providerRef.provider);
+        if (!Number.isInteger(providerRef.maxConns) || providerRef.maxConns < 1) {
+          throw new Error(`Pool "${poolId}" provider "${providerRef.provider}" has invalid maxConns (must be positive integer)`);
         }
-        if (!Array.isArray(entry.providers) || entry.providers.length === 0) {
-          throw new Error(`LB group "${key}" must have a non-empty "providers" array`);
-        }
-        const seenIds = new Set();
-        for (const p of entry.providers) {
-          if (!p.id) throw new Error(`LB group "${key}" has a provider missing "id"`);
-          if (!config.models[p.id]) throw new Error(`LB group "${key}" references unknown model "${p.id}"`);
-          if (seenIds.has(p.id)) throw new Error(`LB group "${key}" has duplicate provider "${p.id}"`);
-          seenIds.add(p.id);
-          if (!Number.isInteger(p.maxConns) || p.maxConns < 1) {
-            throw new Error(`LB group "${key}" provider "${p.id}" has invalid maxConns (must be positive integer)`);
-          }
-        }
-        validGroupKeys.add(key);
       }
     }
 
-    // Clean up lbState for removed groups on hot-reload
-    for (const key of lbState.keys()) {
-      if (!validGroupKeys.has(key)) lbState.delete(key);
+    for (const [routeKey, route] of Object.entries(config.routes)) {
+      if (!route || typeof route !== 'object' || Array.isArray(route)) {
+        throw new Error(`Route "${routeKey}" must be an object`);
+      }
+      const hasProvider = typeof route.provider === 'string';
+      const hasPool = typeof route.pool === 'string';
+      if (hasProvider === hasPool) {
+        throw new Error(`Route "${routeKey}" must declare exactly one of "provider" or "pool"`);
+      }
+      if (hasProvider && !config.providers[route.provider]) {
+        throw new Error(`Route "${routeKey}" references unknown provider "${route.provider}"`);
+      }
+      if (hasPool && !config.pools[route.pool]) {
+        throw new Error(`Route "${routeKey}" references unknown pool "${route.pool}"`);
+      }
     }
 
-    const newRouter = JSON.stringify(config.Router);
-    const changed = oldRouter !== newRouter;
+    for (const key of lbState.keys()) {
+      if (!(key in config.pools)) lbState.delete(key);
+    }
 
-    L.info(`Config loaded: ${Object.keys(config.models).length} models, debug=${config.debug}`);
+    const newRoutes = JSON.stringify(config.routes);
+    const newPools = JSON.stringify(config.pools);
+    const changed = oldRoutes !== newRoutes || oldPools !== newPools;
+
+    L.info(`Config loaded: ${Object.keys(config.providers).length} providers, ${Object.keys(config.pools).length} pools, debug=${config.debug}`);
     if (changed) {
-      L.info(`Router changed: ${oldRouter} -> ${newRouter}`);
-      for (const [scenario, modelId] of Object.entries(config.Router)) {
-        if (typeof modelId === 'string') {
-          const m = config.models[modelId];
-          L.info(`  ${scenario}: ${modelId} -> ${m?.baseURL || '?'} (${m?.name || modelId})`);
-        } else if (typeof modelId === 'object' && modelId !== null) {
-          const providerList = modelId.providers.map(p => `${p.id}(${p.maxConns})`).join(', ');
-          L.info(`  ${scenario}: [${modelId.strategy}] ${providerList}`);
+      L.info(`Routes changed: ${oldRoutes} -> ${newRoutes}`);
+      L.info(`Pools changed: ${oldPools} -> ${newPools}`);
+      for (const [routeKey, route] of Object.entries(config.routes)) {
+        if (route.provider) {
+          const provider = config.providers[route.provider];
+          L.info(`  route ${routeKey}: provider ${route.provider} -> ${provider?.baseURL || '?'} (${provider?.model || route.provider})`);
+        } else if (route.pool) {
+          const pool = config.pools[route.pool];
+          const providerList = (pool?.providers || []).map(p => `${p.provider}(${p.maxConns})`).join(', ');
+          L.info(`  route ${routeKey}: pool ${route.pool} [${pool?.strategy || '?'}] ${providerList}`);
         }
       }
     }
@@ -348,29 +392,27 @@ watchFile(CONFIG_PATH, { interval: 2000 }, () => {
 });
 
 /** Selects a provider, passing logger to the LB module. */
-function selectProviderWithLog(groupKey, group) {
-  return selectProvider(groupKey, group, L);
+function selectProviderWithLog(poolKey, pool) {
+  return selectProvider(poolKey, pool, L);
 }
 
 /**
- * Resolves a Router key or model config ID to a routing entry.
- * Router-first: if resolvedKey matches a Router key, that takes precedence.
- * @param {string} resolvedKey - Key returned by detectors or direct lookup
- * @returns {{ type: 'router', key: string, entry: string|object } | { type: 'direct', modelConf: Object, id: string } | null}
+ * Resolves a route key to a routing entry.
+ * @param {string} routeKey - Key returned by detectors
+ * @returns {{ key: string, entry: RouteConfig } | null}
  */
-function resolveRouterEntry(resolvedKey) {
-  const entry = config.Router[resolvedKey];
-  if (entry !== undefined) return { type: 'router', key: resolvedKey, entry };
-  if (config.models[resolvedKey]) return { type: 'direct', modelConf: config.models[resolvedKey], id: resolvedKey };
+function resolveRouteEntry(routeKey) {
+  const entry = config.routes[routeKey];
+  if (entry !== undefined) return { key: routeKey, entry };
   return null;
 }
 
 /**
- * Reads the LoadBalancer section from config.
+ * Reads the loadBalancer section from config.
  * @returns {{ showProvider?: boolean }}
  */
 function getLbConfig() {
-  return config.LoadBalancer || {};
+  return config.loadBalancer || {};
 }
 
 // ─── Token Estimation ─────────────────────────────────────────────────────────
@@ -486,32 +528,32 @@ await loadCustomDetectors();
 // ─── Scenario Resolution ──────────────────────────────────────────────────────
 
 /**
- * Resolves which model to use for a given request by running all detectors.
+ * Resolves which provider or route key to use for a given request by running all detectors.
  * Detectors are checked in priority order; first match wins.
  * @param {Object} body - Anthropic API request body
  * @param {number} tokenCount - Estimated token count
  * @param {{ info: Function, warn: Function, error: Function, debug: Function }} [reqLog] - Optional request-scoped logger
- * @returns {string|null} Resolved model ID, or null if no match
+ * @returns {string|null} Resolved provider ID or route key, or null if no match
  */
 function resolveModel(body, tokenCount, reqLog) {
   const logger = reqLog || L;
   const ctx = { tokenCount, config };
 
   for (const detector of allDetectors) {
-    const modelId = detector.detect(body, ctx);
-    if (modelId) {
-      logger.debug(`${detector.name} -> ${modelId}`);
-      return modelId;
+    const resolvedTarget = detector.detect(body, ctx);
+    if (resolvedTarget) {
+      logger.debug(`${detector.name} -> ${resolvedTarget}`);
+      return resolvedTarget;
     }
   }
 
-  if (body.model && ctx.config.models[body.model]) {
+  if (body.model && ctx.config.providers[body.model]) {
     logger.debug(`direct -> ${body.model}`);
     return body.model;
   }
 
-  const defaultModel = config.Router.default;
-  if (defaultModel) {
+  const defaultRoute = config.routes.default;
+  if (defaultRoute) {
     logger.debug(`default -> default`);
     return 'default';
   }
@@ -866,55 +908,87 @@ function forwardNonPost(targetURL, method, reqHeaders, res, onClose) {
   proxyReq.end();
 }
 
-// ─── Model Lookup & Request Routing ───────────────────────────────────────────
+// ─── Provider Lookup & Request Routing ────────────────────────────────────────
 
 /**
- * Gets model configuration by ID.
- * @param {string} modelId
- * @returns {ModelConfig|null}
+ * Gets provider configuration by ID.
+ * @param {string} providerId
+ * @returns {ProviderConfig|null}
  */
-function getModelConfig(modelId) {
-  return config.models[modelId] || null;
+function getProviderConfig(providerId) {
+  return config.providers[providerId] || null;
 }
 
 /**
- * Falls back to the first configured model when no explicit default is available.
- * @returns {{ id: string, providerId: string } & ModelConfig | null}
+ * Falls back to the first configured provider when no explicit default route is available.
+ * @returns {{ id: string, providerId: string } & ProviderConfig | null}
  */
-function firstModelFallback() {
-  const firstId = Object.keys(config.models)[0];
-  if (firstId) return { id: firstId, providerId: firstId, ...config.models[firstId] };
+function firstProviderFallback() {
+  const firstId = Object.keys(config.providers)[0];
+  if (firstId) return { id: firstId, providerId: firstId, ...config.providers[firstId] };
   return null;
 }
 
 /**
- * Gets the default model configuration.
- * Handles both string Router.default (single provider) and object (LB group).
- * Falls back to the first configured model if no explicit default.
- * @returns {{ id: string, providerId: string } & ModelConfig | null}
+ * Finds a provider definition inside a pool.
+ * @param {PoolConfig} pool
+ * @param {string} providerId
+ * @returns {{provider: string, maxConns: number}|null}
  */
-function getDefaultModelConfig() {
-  const defaultEntry = config.Router.default;
-  if (!defaultEntry) return firstModelFallback();
-  // String: single provider
-  if (typeof defaultEntry === 'string') {
-    if (config.models[defaultEntry]) return { id: defaultEntry, providerId: defaultEntry, ...config.models[defaultEntry] };
-    return firstModelFallback();
-  }
-  // Object: LB group — select a provider
-  if (typeof defaultEntry === 'object') {
-    const pickedId = selectProviderWithLog('default', defaultEntry);
-    if (pickedId && config.models[pickedId]) {
-      return { id: pickedId, providerId: pickedId, ...config.models[pickedId] };
+function findPoolProvider(pool, providerId) {
+  return pool.providers.find(p => p.provider === providerId) || null;
+}
+
+/**
+ * Resolves a route entry into a provider selection.
+ * @param {string} routeKey
+ * @param {RouteConfig} route
+ * @returns {{ providerId: string, poolId: string|null, maxConns: number|null } & ProviderConfig}
+ */
+function resolveRouteTarget(routeKey, route) {
+  if (route.provider) {
+    const provider = getProviderConfig(route.provider);
+    if (!provider) {
+      throw new Error(`Route "${routeKey}" references unknown provider "${route.provider}"`);
     }
-    return firstModelFallback();
+    return { providerId: route.provider, poolId: null, maxConns: null, ...provider };
   }
-  return null;
+
+  const pool = config.pools[route.pool];
+  if (!pool) {
+    throw new Error(`Route "${routeKey}" references unknown pool "${route.pool}"`);
+  }
+  const pickedId = selectProviderWithLog(route.pool, pool);
+  if (!pickedId) {
+    throw new Error(`Pool "${route.pool}" has no available providers`);
+  }
+  const provider = getProviderConfig(pickedId);
+  if (!provider) {
+    throw new Error(`Pool "${route.pool}" selected provider "${pickedId}" not in providers config`);
+  }
+  const poolProvider = findPoolProvider(pool, pickedId);
+  return {
+    providerId: pickedId,
+    poolId: route.pool,
+    maxConns: poolProvider?.maxConns ?? null,
+    ...provider,
+  };
 }
 
 /**
- * Main routing logic: parses request, resolves target model, and forwards.
- * Uses resolveRouterEntry to disambiguate Router keys from model config IDs.
+ * Gets the default provider configuration.
+ * Falls back to the first configured provider if no explicit default route.
+ * @returns {{ providerId: string, poolId: string|null, maxConns: number|null } & ProviderConfig | null}
+ */
+function getDefaultProviderConfig() {
+  const defaultRoute = resolveRouteEntry('default');
+  if (!defaultRoute) return firstProviderFallback();
+  return resolveRouteTarget(defaultRoute.key, defaultRoute.entry);
+}
+
+/**
+ * Main routing logic: parses request, resolves target provider, and forwards.
+ * Uses resolveRouteEntry to disambiguate route keys from direct provider IDs.
  * @param {string} pathname - Request URL pathname (e.g., /v1/messages)
  * @param {Object} reqHeaders - Original request headers
  * @param {string} rawBody - Raw request body (JSON string)
@@ -934,83 +1008,79 @@ function routeAndForward(pathname, reqHeaders, rawBody, res) {
   // Snapshot original request before any modification
   const originalParsed = JSON.parse(rawBody);
 
-  // Resolve model key (Router key or model config ID)
+  // Resolve route key or direct provider ID
   const resolvedKey = resolveModel(parsed, estimateTokenCount(parsed), ctx.log);
   if (!resolvedKey) {
     res.writeHead(400, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ type: 'error', error: { message: 'No model resolved and no default configured' } }));
   }
 
-  // Disambiguate: Router key vs model config ID
-  const routing = resolveRouterEntry(resolvedKey);
-
-  let modelConf;
+  const route = resolveRouteEntry(resolvedKey);
+  let providerConf;
   let providerId;
-  let groupKey = null;
+  let routeKey = null;
+  let poolId = null;
+  let maxConns = null;
 
-  if (!routing) {
-    // Unknown key: fall back to default
-    const defaultConf = getDefaultModelConfig();
+  if (!route && !config.providers[resolvedKey]) {
+    const defaultConf = getDefaultProviderConfig();
     if (!defaultConf) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ type: 'error', error: { message: `Unknown model "${resolvedKey}" and no default configured` } }));
+      return res.end(JSON.stringify({ type: 'error', error: { message: `Unknown target "${resolvedKey}" and no default configured` } }));
     }
-    L.warn(`Unknown key "${resolvedKey}", using default (${defaultConf.id})`);
-    modelConf = defaultConf;
+    L.warn(`Unknown key "${resolvedKey}", using default (${defaultConf.providerId})`);
+    routeKey = 'default';
+    providerConf = defaultConf;
     providerId = defaultConf.providerId;
-  } else if (routing.type === 'router' && typeof routing.entry === 'string') {
-    // Router key → single provider (backward compatible)
-    const mc = getModelConfig(routing.entry);
-    if (!mc) {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ type: 'error', error: { message: `Router.${routing.key} references unknown model "${routing.entry}"` } }));
+    poolId = defaultConf.poolId;
+    maxConns = defaultConf.maxConns;
+  } else if (route) {
+    try {
+      const resolved = resolveRouteTarget(route.key, route.entry);
+      routeKey = route.key;
+      providerConf = resolved;
+      providerId = resolved.providerId;
+      poolId = resolved.poolId;
+      maxConns = resolved.maxConns;
+    } catch (error) {
+      const message = error.message || String(error);
+      if (message.includes('has no available providers')) {
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+      } else if (message.includes('selected provider')) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+      } else {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+      }
+      return res.end(JSON.stringify({ type: 'error', error: { message } }));
     }
-    modelConf = mc;
-    providerId = routing.entry;
-  } else if (routing.type === 'router' && typeof routing.entry === 'object') {
-    // Router key → LB group
-    groupKey = routing.key;
-    const pickedId = selectProviderWithLog(groupKey, routing.entry);
-    if (!pickedId) {
-      res.writeHead(503, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ type: 'error', error: { message: `LB group "${groupKey}" has no available providers` } }));
-    }
-    const mc = getModelConfig(pickedId);
-    if (!mc) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ type: 'error', error: { message: `LB selected provider "${pickedId}" not in models config` } }));
-    }
-    modelConf = mc;
-    providerId = pickedId;
   } else {
-    // Direct model config ID (from detectExplicitModel or direct lookup)
-    modelConf = routing.modelConf;
-    providerId = routing.id;
+    providerConf = getProviderConfig(resolvedKey);
+    providerId = resolvedKey;
   }
 
-  // Connection tracking
   const tracker = withConnTracking(providerId);
 
-  const target = modelConf.baseURL.replace(/\/+$/, '') + pathname;
-  const actualModel = modelConf.name || providerId;
+  const target = providerConf.baseURL.replace(/\/+$/, '') + pathname;
+  const actualModel = providerConf.model || providerId;
   const originalModel = parsed.model;
 
-  // Build forwarded body immutably — never mutate the original parsed object
   const forwarded = {
     ...parsed,
     model: actualModel,
-    ...(modelConf.maxTokens && parsed.max_tokens && parsed.max_tokens > modelConf.maxTokens
-      ? { max_tokens: modelConf.maxTokens }
+    ...(providerConf.maxTokens && parsed.max_tokens && parsed.max_tokens > providerConf.maxTokens
+      ? { max_tokens: providerConf.maxTokens }
       : {}),
   };
 
-  // Consolidated routing log — one line per request
-  const maxConns = groupKey ? (routing.entry?.providers?.find(p => p.id === providerId)?.maxConns || '?') : null;
-  const lbInfo = groupKey ? ` [${groupKey} ${getConns(providerId)}/${maxConns} active]` : '';
+  const lbInfo = poolId
+    ? ` [route=${routeKey} pool=${poolId} provider=${providerId} ${getConns(providerId)}/${maxConns ?? '?'} active]`
+    : routeKey
+      ? ` [route=${routeKey} provider=${providerId}]`
+      : '';
   ctx.log.info(`${originalModel} -> ${actualModel}${lbInfo}`);
   ctx.log.debug(`-> ${target}`);
-  if (modelConf.maxTokens && parsed.max_tokens && parsed.max_tokens > modelConf.maxTokens) {
-    ctx.log.info(`  max_tokens: ${parsed.max_tokens} -> ${modelConf.maxTokens}`);
+  if (providerConf.maxTokens && parsed.max_tokens && parsed.max_tokens > providerConf.maxTokens) {
+    ctx.log.info(`  max_tokens: ${parsed.max_tokens} -> ${providerConf.maxTokens}`);
   }
 
   const bodyBuf = Buffer.from(JSON.stringify(forwarded));
@@ -1020,9 +1090,9 @@ function routeAndForward(pathname, reqHeaders, rawBody, res) {
   delete fwdHeaders['transfer-encoding'];
   delete fwdHeaders.connection;
 
-  if (modelConf.apiKey) {
-    fwdHeaders['x-api-key'] = modelConf.apiKey;
-    fwdHeaders['authorization'] = `Bearer ${modelConf.apiKey}`;
+  if (providerConf.apiKey) {
+    fwdHeaders['x-api-key'] = providerConf.apiKey;
+    fwdHeaders['authorization'] = `Bearer ${providerConf.apiKey}`;
   }
 
   // Debug dump
@@ -1036,7 +1106,11 @@ function routeAndForward(pathname, reqHeaders, rawBody, res) {
     onClose: (statusCode) => {
       tracker.cleanup();
       const elapsed = Date.now() - ctx.startTime;
-      const lbEnd = groupKey ? ` [${groupKey} ${getConns(providerId)}/${maxConns} active]` : '';
+      const lbEnd = poolId
+        ? ` [route=${routeKey} pool=${poolId} provider=${providerId} ${getConns(providerId)}/${maxConns ?? '?'} active]`
+        : routeKey
+          ? ` [route=${routeKey} provider=${providerId}]`
+          : '';
       const is2xx = Number.isInteger(statusCode) && statusCode >= 200 && statusCode < 300;
       const logFn = is2xx ? ctx.log.info : ctx.log.warn;
       logFn(`END ${actualModel} ${statusCode ?? '?'} ${elapsed}ms${lbEnd}`);
@@ -1054,36 +1128,34 @@ const server = createServer(async (req, res) => {
   const pathname = parsedUrl.pathname;
 
   if (pathname === '/health' && req.method === 'GET') {
-    // Build LB status from active LB groups (no credentials exposed)
+    // Build LB status from named pools (no credentials exposed)
     const lbStatus = {};
-    for (const [key, entry] of Object.entries(config.Router)) {
-      if (typeof entry === 'object' && entry !== null && Array.isArray(entry.providers)) {
-        lbStatus[key] = {
-          strategy: entry.strategy,
-          providers: entry.providers.map(p => ({
-            id: p.id,
-            activeConns: getConns(p.id),
-            maxConns: p.maxConns,
-          })),
-        };
-      }
+    for (const [poolId, pool] of Object.entries(config.pools)) {
+      lbStatus[poolId] = {
+        strategy: pool.strategy,
+        providers: pool.providers.map(p => ({
+          provider: p.provider,
+          activeConns: getConns(p.provider),
+          maxConns: p.maxConns,
+        })),
+      };
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({
       status: 'ok',
-      models: Object.keys(config.models),
-      router: config.Router,
-      loadBalancer: { groups: lbStatus },
+      providers: Object.keys(config.providers),
+      routes: config.routes,
+      loadBalancer: { pools: lbStatus },
       debug: config.debug,
     }));
   }
 
   if (pathname === '/v1/models' && req.method === 'GET') {
     const now = new Date().toISOString();
-    const data = Object.entries(config.models).map(([id, m]) => ({
+    const data = Object.entries(config.providers).map(([id, provider]) => ({
       id,
       type: 'model',
-      display_name: id,
+      display_name: provider.model || id,
       created_at: now,
     }));
     const body = JSON.stringify({
@@ -1092,13 +1164,13 @@ const server = createServer(async (req, res) => {
       first_id: data[0]?.id || '',
       last_id: data[data.length - 1]?.id || '',
     });
-    L.info(`GET /v1/models -> ${data.length} models`);
+    L.info(`GET /v1/models -> ${data.length} providers`);
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(body);
   }
 
   if (req.method !== 'POST') {
-    const defaultConf = getDefaultModelConfig();
+    const defaultConf = getDefaultProviderConfig();
     if (defaultConf) {
       const tracker = withConnTracking(defaultConf.providerId);
       const target = defaultConf.baseURL.replace(/\/+$/, '') + pathname;
@@ -1125,15 +1197,17 @@ const port = config.port || DEFAULT_PORT;
 server.listen(port, '127.0.0.1', () => {
   L.info(`Custom Model Proxy started on http://127.0.0.1:${port}`);
   L.info(`Config: ${CONFIG_PATH}`);
-  L.info(`Models: ${Object.keys(config.models).join(', ') || 'none'}`);
+  L.info(`Providers: ${Object.keys(config.providers).join(', ') || 'none'}`);
+  L.info(`Pools: ${Object.keys(config.pools).join(', ') || 'none'}`);
   L.info(`Debug: ${config.debug ? 'ON' : 'OFF'}`);
-  for (const [scenario, modelId] of Object.entries(config.Router)) {
-    if (typeof modelId === 'string') {
-      const m = config.models[modelId];
-      L.info(`  ${scenario}: ${modelId} -> ${m?.baseURL || '?'} (${m?.name || modelId})`);
-    } else if (typeof modelId === 'object' && modelId !== null) {
-      const providerList = modelId.providers.map(p => `${p.id}(${p.maxConns})`).join(', ');
-      L.info(`  ${scenario}: [${modelId.strategy}] ${providerList}`);
+  for (const [routeKey, route] of Object.entries(config.routes)) {
+    if (route.provider) {
+      const provider = config.providers[route.provider];
+      L.info(`  route ${routeKey}: provider ${route.provider} -> ${provider?.baseURL || '?'} (${provider?.model || route.provider})`);
+    } else if (route.pool) {
+      const pool = config.pools[route.pool];
+      const providerList = (pool?.providers || []).map(p => `${p.provider}(${p.maxConns})`).join(', ');
+      L.info(`  route ${routeKey}: pool ${route.pool} [${pool?.strategy || '?'}] ${providerList}`);
     }
   }
   writeFileSync(PID_PATH, String(process.pid));

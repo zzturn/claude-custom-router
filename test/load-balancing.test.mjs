@@ -2,8 +2,10 @@ import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  strategies, activeConns, getConns, withConnTracking,
+  strategies, activeConns, getConns, selectProvider, withConnTracking,
 } from '../src/load-balancer.mjs';
+
+const noopLogger = { warn: () => {} };
 
 // ─── Strategy Tests ────────────────────────────────────────────────────────
 
@@ -13,8 +15,8 @@ describe('priority-fallback strategy', () => {
 
   it('should select first provider with available capacity', () => {
     const providers = [
-      { id: 'primary', maxConns: 5 },
-      { id: 'backup', maxConns: 3 },
+      { provider: 'primary', maxConns: 5 },
+      { provider: 'backup', maxConns: 3 },
     ];
     const ctx = makeCtx({ primary: 3, backup: 0 });
     assert.equal(priorityFallback(providers, ctx), 'primary');
@@ -22,8 +24,8 @@ describe('priority-fallback strategy', () => {
 
   it('should overflow to second provider when primary is full', () => {
     const providers = [
-      { id: 'primary', maxConns: 5 },
-      { id: 'backup', maxConns: 3 },
+      { provider: 'primary', maxConns: 5 },
+      { provider: 'backup', maxConns: 3 },
     ];
     const ctx = makeCtx({ primary: 5, backup: 1 });
     assert.equal(priorityFallback(providers, ctx), 'backup');
@@ -31,8 +33,8 @@ describe('priority-fallback strategy', () => {
 
   it('should fail-open to first provider when all full', () => {
     const providers = [
-      { id: 'primary', maxConns: 2 },
-      { id: 'backup', maxConns: 1 },
+      { provider: 'primary', maxConns: 2 },
+      { provider: 'backup', maxConns: 1 },
     ];
     const ctx = makeCtx({ primary: 2, backup: 1 });
     assert.equal(priorityFallback(providers, ctx), 'primary');
@@ -48,23 +50,23 @@ describe('priority-fallback strategy', () => {
 
   it('should select first provider when all have zero connections', () => {
     const providers = [
-      { id: 'a', maxConns: 3 },
-      { id: 'b', maxConns: 3 },
+      { provider: 'a', maxConns: 3 },
+      { provider: 'b', maxConns: 3 },
     ];
     assert.equal(priorityFallback(providers, makeCtx({})), 'a');
   });
 
   it('should handle single provider', () => {
-    const providers = [{ id: 'solo', maxConns: 2 }];
+    const providers = [{ provider: 'solo', maxConns: 2 }];
     const ctx = makeCtx({ solo: 1 });
     assert.equal(priorityFallback(providers, ctx), 'solo');
   });
 
   it('should overflow through multiple providers', () => {
     const providers = [
-      { id: 'p1', maxConns: 1 },
-      { id: 'p2', maxConns: 1 },
-      { id: 'p3', maxConns: 1 },
+      { provider: 'p1', maxConns: 1 },
+      { provider: 'p2', maxConns: 1 },
+      { provider: 'p3', maxConns: 1 },
     ];
     const ctx = makeCtx({ p1: 1, p2: 1, p3: 0 });
     assert.equal(priorityFallback(providers, ctx), 'p3');
@@ -111,45 +113,111 @@ describe('withConnTracking', () => {
   });
 });
 
+describe('cross-pool provider capacity', () => {
+  beforeEach(() => { activeConns.clear(); });
+
+  it('should share activeConns across pools when they reuse the same provider ID', () => {
+    const haikuPool = {
+      strategy: 'priority-fallback',
+      providers: [
+        { provider: 'glm', maxConns: 1 },
+        { provider: 'haiku-backup', maxConns: 2 },
+      ],
+    };
+    const sonnetPool = {
+      strategy: 'priority-fallback',
+      providers: [
+        { provider: 'glm', maxConns: 1 },
+        { provider: 'sonnet-backup', maxConns: 2 },
+      ],
+    };
+
+    const pickedForHaiku = selectProvider('haiku-primary', haikuPool, noopLogger);
+    assert.equal(pickedForHaiku, 'glm');
+
+    const tracker = withConnTracking(pickedForHaiku);
+    assert.equal(getConns('glm'), 1);
+
+    const pickedForSonnet = selectProvider('sonnet-primary', sonnetPool, noopLogger);
+    assert.equal(pickedForSonnet, 'sonnet-backup');
+
+    tracker.cleanup();
+  });
+
+  it('should keep capacities isolated when pools use different provider IDs', () => {
+    const haikuPool = {
+      strategy: 'priority-fallback',
+      providers: [
+        { provider: 'glm', maxConns: 1 },
+        { provider: 'haiku-backup', maxConns: 2 },
+      ],
+    };
+    const sonnetPool = {
+      strategy: 'priority-fallback',
+      providers: [
+        { provider: 'zai_glm', maxConns: 1 },
+        { provider: 'sonnet-backup', maxConns: 2 },
+      ],
+    };
+
+    const tracker = withConnTracking('glm');
+    assert.equal(getConns('glm'), 1);
+    assert.equal(getConns('zai_glm'), 0);
+
+    const pickedForSonnet = selectProvider('sonnet-primary', sonnetPool, noopLogger);
+    assert.equal(pickedForSonnet, 'zai_glm');
+
+    tracker.cleanup();
+  });
+});
+
 // ─── Config Validation Tests ───────────────────────────────────────────────
 
 describe('LB config validation', () => {
   function validateConfig(config) {
     const errors = [];
-    const models = config.models || {};
-    const router = config.Router || {};
+    const providers = config.providers || {};
+    const pools = config.pools || {};
+    const routes = config.routes || {};
     const knownStrategies = Object.keys(strategies);
 
-    // Check collision: model ID == Router key
-    for (const modelId of Object.keys(models)) {
-      if (modelId in router) {
-        errors.push(`collision: model "${modelId}" == Router key`);
-      }
+    for (const providerId of Object.keys(providers)) {
+      if (providerId in routes) errors.push(`collision: provider "${providerId}" == route key`);
+      if (providerId in pools) errors.push(`collision: provider "${providerId}" == pool key`);
     }
 
-    // Validate LB groups
-    for (const [key, entry] of Object.entries(router)) {
-      if (typeof entry === 'object' && entry !== null) {
-        if (!entry.strategy) errors.push(`group "${key}" missing strategy`);
-        if (!knownStrategies.includes(entry.strategy)) {
-          errors.push(`group "${key}" unknown strategy "${entry.strategy}"`);
-        }
-        if (!Array.isArray(entry.providers) || entry.providers.length === 0) {
-          errors.push(`group "${key}" empty providers`);
-        }
-        if (Array.isArray(entry.providers)) {
-          const seenIds = new Set();
-          for (const p of entry.providers) {
-            if (!p.id) errors.push(`group "${key}" provider missing id`);
-            if (!models[p.id]) errors.push(`group "${key}" unknown model "${p.id}"`);
-            if (seenIds.has(p.id)) errors.push(`group "${key}" duplicate "${p.id}"`);
-            seenIds.add(p.id);
-            if (!Number.isInteger(p.maxConns) || p.maxConns < 1) {
-              errors.push(`group "${key}" invalid maxConns for "${p.id}"`);
-            }
+    for (const poolId of Object.keys(pools)) {
+      if (poolId in routes) errors.push(`collision: pool "${poolId}" == route key`);
+    }
+
+    for (const [poolId, pool] of Object.entries(pools)) {
+      if (!pool.strategy) errors.push(`pool "${poolId}" missing strategy`);
+      if (!knownStrategies.includes(pool.strategy)) {
+        errors.push(`pool "${poolId}" unknown strategy "${pool.strategy}"`);
+      }
+      if (!Array.isArray(pool.providers) || pool.providers.length === 0) {
+        errors.push(`pool "${poolId}" empty providers`);
+      }
+      if (Array.isArray(pool.providers)) {
+        const seenProviders = new Set();
+        for (const providerRef of pool.providers) {
+          if (!providerRef.provider) errors.push(`pool "${poolId}" provider missing provider`);
+          if (!providers[providerRef.provider]) errors.push(`pool "${poolId}" unknown provider "${providerRef.provider}"`);
+          if (seenProviders.has(providerRef.provider)) errors.push(`pool "${poolId}" duplicate "${providerRef.provider}"`);
+          seenProviders.add(providerRef.provider);
+          if (!Number.isInteger(providerRef.maxConns) || providerRef.maxConns < 1) {
+            errors.push(`pool "${poolId}" invalid maxConns for "${providerRef.provider}"`);
           }
         }
       }
+    }
+
+    for (const [routeId, route] of Object.entries(routes)) {
+      const hasProvider = typeof route?.provider === 'string';
+      const hasPool = typeof route?.pool === 'string';
+      if (hasProvider === hasPool) errors.push(`route "${routeId}" invalid target`);
+      if (hasProvider && !providers[route.provider]) errors.push(`route "${routeId}" unknown provider "${route.provider}"`);
+      if (hasPool && !pools[route.pool]) errors.push(`route "${routeId}" unknown pool "${route.pool}"`);
     }
 
     return errors;
@@ -157,49 +225,52 @@ describe('LB config validation', () => {
 
   it('should pass for valid LB config', () => {
     const errors = validateConfig({
-      models: { 'ds-sonnet': { name: 'ds', baseURL: 'https://a', apiKey: 'k' } },
-      Router: {
-        sonnet: {
+      providers: { 'ds-sonnet': { model: 'ds', baseURL: 'https://a', apiKey: 'k' } },
+      pools: {
+        'sonnet-primary': {
           strategy: 'priority-fallback',
-          providers: [{ id: 'ds-sonnet', maxConns: 5 }],
+          providers: [{ provider: 'ds-sonnet', maxConns: 5 }],
         },
+      },
+      routes: {
+        sonnet: { pool: 'sonnet-primary' },
       },
     });
     assert.equal(errors.length, 0);
   });
 
-  it('should reject model ID colliding with Router key', () => {
+  it('should reject provider ID colliding with route key', () => {
     const errors = validateConfig({
-      models: { 'sonnet': { name: 's', baseURL: 'https://a', apiKey: 'k' } },
-      Router: { 'sonnet': 'sonnet' },
+      providers: { sonnet: { model: 's', baseURL: 'https://a', apiKey: 'k' } },
+      routes: { sonnet: { provider: 'sonnet' } },
     });
     assert.ok(errors.some(e => e.includes('collision')));
   });
 
-  it('should reject LB group with unknown provider', () => {
+  it('should reject pool with unknown provider', () => {
     const errors = validateConfig({
-      models: {},
-      Router: {
-        sonnet: {
+      providers: {},
+      pools: {
+        'sonnet-primary': {
           strategy: 'priority-fallback',
-          providers: [{ id: 'nonexistent', maxConns: 3 }],
+          providers: [{ provider: 'nonexistent', maxConns: 3 }],
         },
       },
     });
-    assert.ok(errors.some(e => e.includes('unknown model')));
+    assert.ok(errors.some(e => e.includes('unknown provider')));
   });
 
-  it('should reject LB group with duplicate provider', () => {
+  it('should reject pool with duplicate provider', () => {
     const errors = validateConfig({
-      models: {
-        'ds': { name: 'ds', baseURL: 'https://a', apiKey: 'k' },
+      providers: {
+        ds: { model: 'ds', baseURL: 'https://a', apiKey: 'k' },
       },
-      Router: {
-        sonnet: {
+      pools: {
+        'sonnet-primary': {
           strategy: 'priority-fallback',
           providers: [
-            { id: 'ds', maxConns: 3 },
-            { id: 'ds', maxConns: 5 },
+            { provider: 'ds', maxConns: 3 },
+            { provider: 'ds', maxConns: 5 },
           ],
         },
       },
@@ -207,56 +278,109 @@ describe('LB config validation', () => {
     assert.ok(errors.some(e => e.includes('duplicate')));
   });
 
-  it('should reject LB group with invalid maxConns', () => {
+  it('should allow the same provider ID to appear in multiple pools', () => {
     const errors = validateConfig({
-      models: { 'ds': { name: 'ds', baseURL: 'https://a', apiKey: 'k' } },
-      Router: {
-        sonnet: {
+      providers: {
+        glm: { model: 'glm-4', baseURL: 'https://a', apiKey: 'k' },
+        backup: { model: 'backup', baseURL: 'https://b', apiKey: 'k' },
+      },
+      pools: {
+        'haiku-primary': {
           strategy: 'priority-fallback',
-          providers: [{ id: 'ds', maxConns: 0 }],
+          providers: [
+            { provider: 'glm', maxConns: 2 },
+            { provider: 'backup', maxConns: 1 },
+          ],
+        },
+        'sonnet-primary': {
+          strategy: 'priority-fallback',
+          providers: [
+            { provider: 'glm', maxConns: 2 },
+          ],
+        },
+      },
+      routes: {
+        haiku: { pool: 'haiku-primary' },
+        sonnet: { pool: 'sonnet-primary' },
+      },
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('should reject route with unknown provider', () => {
+    const errors = validateConfig({
+      providers: {},
+      routes: {
+        default: { provider: 'missing' },
+      },
+    });
+    assert.ok(errors.some(e => e.includes('unknown provider')));
+  });
+
+  it('should reject route with unknown pool', () => {
+    const errors = validateConfig({
+      providers: {},
+      pools: {},
+      routes: {
+        sonnet: { pool: 'missing-pool' },
+      },
+    });
+    assert.ok(errors.some(e => e.includes('unknown pool')));
+  });
+
+  it('should reject route declaring both provider and pool', () => {
+    const errors = validateConfig({
+      providers: { glm: { model: 'glm', baseURL: 'https://a', apiKey: 'k' } },
+      pools: { p1: { strategy: 'priority-fallback', providers: [{ provider: 'glm', maxConns: 1 }] } },
+      routes: {
+        default: { provider: 'glm', pool: 'p1' },
+      },
+    });
+    assert.ok(errors.some(e => e.includes('invalid target')));
+  });
+
+  it('should reject pool with invalid maxConns', () => {
+    const errors = validateConfig({
+      providers: { ds: { model: 'ds', baseURL: 'https://a', apiKey: 'k' } },
+      pools: {
+        'sonnet-primary': {
+          strategy: 'priority-fallback',
+          providers: [{ provider: 'ds', maxConns: 0 }],
         },
       },
     });
     assert.ok(errors.some(e => e.includes('invalid maxConns')));
   });
 
-  it('should reject LB group with missing strategy', () => {
+  it('should reject pool with missing strategy', () => {
     const errors = validateConfig({
-      models: { 'ds': { name: 'ds', baseURL: 'https://a', apiKey: 'k' } },
-      Router: {
-        sonnet: {
-          providers: [{ id: 'ds', maxConns: 3 }],
+      providers: { ds: { model: 'ds', baseURL: 'https://a', apiKey: 'k' } },
+      pools: {
+        'sonnet-primary': {
+          providers: [{ provider: 'ds', maxConns: 3 }],
         },
       },
     });
     assert.ok(errors.some(e => e.includes('missing strategy')));
   });
 
-  it('should reject LB group with empty providers', () => {
+  it('should reject pool with empty providers', () => {
     const errors = validateConfig({
-      models: {},
-      Router: {
-        sonnet: { strategy: 'priority-fallback', providers: [] },
+      providers: {},
+      pools: {
+        'sonnet-primary': { strategy: 'priority-fallback', providers: [] },
       },
     });
     assert.ok(errors.some(e => e.includes('empty providers')));
   });
 
-  it('should pass for string Router values (backward compat)', () => {
+  it('should reject pool with unknown strategy', () => {
     const errors = validateConfig({
-      models: { 'glm': { name: 'glm', baseURL: 'https://a', apiKey: 'k' } },
-      Router: { default: 'glm', haiku: 'glm' },
-    });
-    assert.equal(errors.length, 0);
-  });
-
-  it('should reject LB group with unknown strategy', () => {
-    const errors = validateConfig({
-      models: { 'ds': { name: 'ds', baseURL: 'https://a', apiKey: 'k' } },
-      Router: {
-        sonnet: {
+      providers: { ds: { model: 'ds', baseURL: 'https://a', apiKey: 'k' } },
+      pools: {
+        'sonnet-primary': {
           strategy: 'round-robin',
-          providers: [{ id: 'ds', maxConns: 3 }],
+          providers: [{ provider: 'ds', maxConns: 3 }],
         },
       },
     });

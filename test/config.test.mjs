@@ -4,9 +4,6 @@ import { writeFileSync, readFileSync, mkdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
-// Test config loading logic in isolation
-// We simulate the resolveEnvVar and config parsing
-
 function resolveEnvVar(value) {
   if (typeof value !== 'string') return value;
   if (value.startsWith('${') && value.endsWith('}'))
@@ -21,16 +18,18 @@ function parseConfig(raw) {
   const config = {
     port: parsed.port || 8082,
     debug: parsed.debug || false,
-    Router: parsed.Router || {},
-    models: {},
+    routes: parsed.routes || {},
+    pools: parsed.pools || {},
+    loadBalancer: parsed.loadBalancer || {},
+    providers: {},
   };
 
-  for (const [id, m] of Object.entries(parsed.models || {})) {
-    config.models[id] = {
-      name: m.name || id,
-      baseURL: resolveEnvVar(m.baseURL),
-      apiKey: resolveEnvVar(m.apiKey),
-      maxTokens: m.maxTokens || null,
+  for (const [id, provider] of Object.entries(parsed.providers || {})) {
+    config.providers[id] = {
+      model: provider.model || id,
+      baseURL: resolveEnvVar(provider.baseURL),
+      apiKey: resolveEnvVar(provider.apiKey),
+      maxTokens: provider.maxTokens || null,
     };
   }
 
@@ -71,10 +70,17 @@ describe('parseConfig', () => {
     const config = parseConfig(JSON.stringify({
       port: 9090,
       debug: true,
-      Router: { default: 'model-a' },
-      models: {
-        'model-a': {
-          name: 'actual-name',
+      routes: { default: { provider: 'provider-a' } },
+      pools: {
+        'sonnet-primary': {
+          strategy: 'priority-fallback',
+          providers: [{ provider: 'provider-a', maxConns: 3 }],
+        },
+      },
+      loadBalancer: { showProvider: true },
+      providers: {
+        'provider-a': {
+          model: 'actual-model',
           baseURL: 'https://api.example.com/v1',
           apiKey: 'sk-test',
           maxTokens: 4096,
@@ -84,55 +90,58 @@ describe('parseConfig', () => {
 
     assert.equal(config.port, 9090);
     assert.equal(config.debug, true);
-    assert.equal(config.Router.default, 'model-a');
-    assert.equal(config.models['model-a'].name, 'actual-name');
-    assert.equal(config.models['model-a'].baseURL, 'https://api.example.com/v1');
-    assert.equal(config.models['model-a'].apiKey, 'sk-test');
-    assert.equal(config.models['model-a'].maxTokens, 4096);
+    assert.deepEqual(config.routes.default, { provider: 'provider-a' });
+    assert.equal(config.pools['sonnet-primary'].strategy, 'priority-fallback');
+    assert.equal(config.loadBalancer.showProvider, true);
+    assert.equal(config.providers['provider-a'].model, 'actual-model');
+    assert.equal(config.providers['provider-a'].baseURL, 'https://api.example.com/v1');
+    assert.equal(config.providers['provider-a'].apiKey, 'sk-test');
+    assert.equal(config.providers['provider-a'].maxTokens, 4096);
   });
 
   it('should use defaults for missing fields', () => {
     const config = parseConfig(JSON.stringify({}));
     assert.equal(config.port, 8082);
     assert.equal(config.debug, false);
-    assert.deepEqual(config.Router, {});
-    assert.deepEqual(config.models, {});
+    assert.deepEqual(config.routes, {});
+    assert.deepEqual(config.pools, {});
+    assert.deepEqual(config.providers, {});
   });
 
-  it('should use model ID as name when name is not provided', () => {
+  it('should use provider ID as model when model is not provided', () => {
     const config = parseConfig(JSON.stringify({
-      models: {
-        'my-model': { baseURL: 'https://api.example.com', apiKey: 'key' },
+      providers: {
+        'my-provider': { baseURL: 'https://api.example.com', apiKey: 'key' },
       },
     }));
-    assert.equal(config.models['my-model'].name, 'my-model');
+    assert.equal(config.providers['my-provider'].model, 'my-provider');
   });
 
-  it('should resolve env vars in model config', () => {
+  it('should resolve env vars in provider config', () => {
     process.env.MY_TEST_API_KEY = 'secret-key';
     process.env.MY_TEST_BASE_URL = 'https://custom.api.com';
     const config = parseConfig(JSON.stringify({
-      models: {
-        'test': {
+      providers: {
+        test: {
           baseURL: '${MY_TEST_BASE_URL}',
           apiKey: '$MY_TEST_API_KEY',
         },
       },
     }));
 
-    assert.equal(config.models.test.baseURL, 'https://custom.api.com');
-    assert.equal(config.models.test.apiKey, 'secret-key');
+    assert.equal(config.providers.test.baseURL, 'https://custom.api.com');
+    assert.equal(config.providers.test.apiKey, 'secret-key');
     delete process.env.MY_TEST_API_KEY;
     delete process.env.MY_TEST_BASE_URL;
   });
 
   it('should set maxTokens to null when not provided', () => {
     const config = parseConfig(JSON.stringify({
-      models: {
-        'test': { baseURL: 'https://api.example.com', apiKey: 'key' },
+      providers: {
+        test: { baseURL: 'https://api.example.com', apiKey: 'key' },
       },
     }));
-    assert.equal(config.models.test.maxTokens, null);
+    assert.equal(config.providers.test.maxTokens, null);
   });
 });
 
@@ -151,12 +160,12 @@ describe('config file I/O', () => {
     const configPath = join(testDir, 'config.json');
     writeFileSync(configPath, JSON.stringify({
       port: 3000,
-      models: { 'm1': { name: 'm1', baseURL: 'http://localhost', apiKey: 'k' } },
+      providers: { p1: { model: 'm1', baseURL: 'http://localhost', apiKey: 'k' } },
     }));
 
     const raw = readFileSync(configPath, 'utf8');
     const config = parseConfig(raw);
     assert.equal(config.port, 3000);
-    assert.ok(config.models.m1);
+    assert.ok(config.providers.p1);
   });
 });

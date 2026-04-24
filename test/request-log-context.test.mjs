@@ -18,12 +18,12 @@ const SESSION_PREFIX = 'abc123';
 const TEST_CONFIG = {
   port: PROXY_PORT,
   debug: true,
-  Router: {
-    default: 'test-model',
+  routes: {
+    default: { provider: 'test-provider' },
   },
-  models: {
-    'test-model': {
-      name: 'test-model-name',
+  providers: {
+    'test-provider': {
+      model: 'test-model-name',
       baseURL: `http://127.0.0.1:${UPSTREAM_PORT}`,
       apiKey: 'test-key',
     },
@@ -104,7 +104,7 @@ describe('request log context', () => {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        model: 'test-model',
+        model: 'unknown-model',
         metadata: {
           user_id: JSON.stringify({ session_id: SESSION_ID }),
         },
@@ -116,7 +116,7 @@ describe('request log context', () => {
     assert.equal(res.status, 200);
     assert.deepEqual(await res.json(), { ok: true });
 
-    const routeLogMatch = await waitForMatch(new RegExp(`\\[([a-z0-9]{6})\\]\\[${SESSION_PREFIX}\\] test-model -> test-model-name`));
+    const routeLogMatch = await waitForMatch(new RegExp(`\\[([a-z0-9]{6})\\]\\[${SESSION_PREFIX}\\] unknown-model -> test-model-name \\[route=default provider=test-provider\\]`));
     const reqId = routeLogMatch[1];
     const debugDir = join(LOG_DIR, 'debug', SESSION_ID);
     const debugFiles = await waitForFiles(debugDir);

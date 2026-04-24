@@ -6,21 +6,21 @@ import {
 } from '../src/detectors.mjs';
 
 /**
- * Creates a mock detection context with the given router config and models.
+ * Creates a mock detection context with the given route config and providers.
  */
-function createCtx(routerOverrides = {}, models = {}) {
+function createCtx(routeOverrides = {}, providers = {}) {
   return {
     tokenCount: 1000,
     config: {
-      Router: {
-        default: 'default-model',
-        image: 'vision-model',
-        haiku: 'haiku-model',
-        sonnet: 'sonnet-model',
-        opus: 'opus-model',
-        ...routerOverrides,
+      routes: {
+        default: { provider: 'default-provider' },
+        image: { provider: 'vision-provider' },
+        haiku: { provider: 'haiku-provider' },
+        sonnet: { provider: 'sonnet-provider' },
+        opus: { provider: 'opus-provider' },
+        ...routeOverrides,
       },
-      models,
+      providers,
     },
   };
 }
@@ -30,19 +30,19 @@ function createCtx(routerOverrides = {}, models = {}) {
 describe('detectExplicitModel', () => {
   it('should detect comma-separated model ID', () => {
     const body = { model: 'original,my-model' };
-    const ctx = createCtx({}, { 'my-model': { name: 'my-model' } });
+    const ctx = createCtx({}, { 'my-model': { model: 'my-model' } });
     assert.equal(detectExplicitModel(body, ctx), 'my-model');
   });
 
   it('should return full comma-separated string if it matches a model ID', () => {
     const body = { model: 'a,b' };
-    const ctx = createCtx({}, { 'a,b': { name: 'combined' } });
+    const ctx = createCtx({}, { 'a,b': { model: 'combined' } });
     assert.equal(detectExplicitModel(body, ctx), 'a,b');
   });
 
   it('should return afterComma if no direct match', () => {
     const body = { model: 'x,y,z' };
-    const ctx = createCtx({}, { 'y,z': { name: 'yz' } });
+    const ctx = createCtx({}, { 'y,z': { model: 'yz' } });
     assert.equal(detectExplicitModel(body, ctx), 'y,z');
   });
 

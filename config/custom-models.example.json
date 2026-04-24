@@ -1,59 +1,70 @@
 {
   "port": 8082,
   "debug": false,
-  "Router": {
-    "default": "my-default-model",
-    "image": "vision-model",
-    "haiku": "haiku-provider",
-    "sonnet": {
-      "strategy": "priority-fallback",
-      "providers": [
-        { "id": "deepseek-sonnet", "maxConns": 5 },
-        { "id": "qwen-sonnet",     "maxConns": 3 },
-        { "id": "glm-sonnet",      "maxConns": 3 }
-      ]
-    },
-    "opus": "opus-provider"
-  },
-  "LoadBalancer": {
-    "showProvider": true
-  },
-  "models": {
-    "my-default-model": {
-      "name": "actual-model-name",
+  "upstreamTimeoutMs": 360000,
+  "providers": {
+    "my-default-provider": {
+      "model": "actual-model-name",
       "baseURL": "https://api.provider.com/v1",
       "apiKey": "${YOUR_API_KEY_ENV_VAR}",
       "maxTokens": 8192
     },
     "haiku-provider": {
-      "name": "haiku-model-name",
+      "model": "haiku-model-name",
       "baseURL": "https://api.provider.com/v1",
       "apiKey": "${YOUR_API_KEY_ENV_VAR}"
     },
+    "glm": {
+      "model": "glm-4",
+      "baseURL": "https://open.bigmodel.cn/api/anthropic",
+      "apiKey": "${GLM_API_KEY}"
+    },
     "deepseek-sonnet": {
-      "name": "deepseek-chat",
+      "model": "deepseek-chat",
       "baseURL": "https://api.deepseek.com/anthropic",
       "apiKey": "${DEEPSEEK_API_KEY}"
     },
     "qwen-sonnet": {
-      "name": "qwen-plus",
+      "model": "qwen-plus",
       "baseURL": "https://dashscope.aliyuncs.com/apps/anthropic",
       "apiKey": "${QWEN_API_KEY}"
     },
-    "glm-sonnet": {
-      "name": "glm-4",
-      "baseURL": "https://open.bigmodel.cn/api/anthropic",
-      "apiKey": "${GLM_API_KEY}"
-    },
     "opus-provider": {
-      "name": "opus-model-name",
+      "model": "opus-model-name",
       "baseURL": "https://api.provider.com/v1",
       "apiKey": "${YOUR_API_KEY_ENV_VAR}"
     },
-    "vision-model": {
-      "name": "vision-model-name",
+    "vision-provider": {
+      "model": "vision-model-name",
       "baseURL": "https://api.provider.com/v1",
       "apiKey": "${YOUR_API_KEY_ENV_VAR}"
     }
+  },
+  "pools": {
+    "haiku-primary": {
+      "strategy": "priority-fallback",
+      "providers": [
+        { "provider": "glm", "maxConns": 3 },
+        { "provider": "haiku-provider", "maxConns": 5 }
+      ]
+    },
+    "sonnet-primary": {
+      "strategy": "priority-fallback",
+      "providers": [
+        { "provider": "glm", "maxConns": 3 },
+        { "provider": "deepseek-sonnet", "maxConns": 5 },
+        { "provider": "qwen-sonnet", "maxConns": 3 }
+      ]
+    }
+  },
+  "routes": {
+    "default": { "provider": "my-default-provider" },
+    "image": { "provider": "vision-provider" },
+    "haiku": { "pool": "haiku-primary" },
+    "sonnet": { "pool": "sonnet-primary" },
+    "opus": { "provider": "opus-provider" }
+  },
+  "loadBalancer": {
+    "showProvider": true
   }
 }

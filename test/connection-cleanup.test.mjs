@@ -17,15 +17,18 @@ const TEST_CONFIG = {
   port: PROXY_PORT,
   debug: false,
   upstreamTimeoutMs: 60_000,
-  Router: {
-    default: {
+  pools: {
+    'default-pool': {
       strategy: 'priority-fallback',
-      providers: [{ id: 'slow-provider', maxConns: 5 }],
+      providers: [{ provider: 'slow-provider', maxConns: 5 }],
     },
   },
-  models: {
+  routes: {
+    default: { pool: 'default-pool' },
+  },
+  providers: {
     'slow-provider': {
-      name: 'slow-provider-name',
+      model: 'slow-provider-name',
       baseURL: `http://127.0.0.1:${UPSTREAM_PORT}`,
       apiKey: 'test-key',
     },
@@ -49,7 +52,7 @@ async function waitForActiveConns(expected, timeoutMs = 1500) {
   while (Date.now() < deadline) {
     const res = await fetch(`${BASE_URL}/health`);
     const data = await res.json();
-    const actual = data.loadBalancer.groups.default.providers[0].activeConns;
+    const actual = data.loadBalancer.pools['default-pool'].providers[0].activeConns;
     if (actual === expected) return;
     await new Promise((resolve) => setTimeout(resolve, 50));
   }

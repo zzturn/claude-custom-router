@@ -19,16 +19,16 @@ const BASE_URL = `http://127.0.0.1:${TEST_PORT}`;
 const TEST_CONFIG = {
   port: TEST_PORT,
   debug: false,
-  Router: {
-    default: 'test-model',
-    image: 'test-model',
-    haiku: 'test-model',
-    sonnet: 'test-model',
-    opus: 'test-model',
+  routes: {
+    default: { provider: 'test-provider' },
+    image: { provider: 'test-provider' },
+    haiku: { provider: 'test-provider' },
+    sonnet: { provider: 'test-provider' },
+    opus: { provider: 'test-provider' },
   },
-  models: {
-    'test-model': {
-      name: 'test-model-name',
+  providers: {
+    'test-provider': {
+      model: 'test-model-name',
       baseURL: 'http://127.0.0.1:19999', // Non-existent, will fail but routing is tested
       apiKey: 'test-key',
     },
@@ -85,7 +85,8 @@ describe('HTTP Server Integration', () => {
     assert.equal(res.status, 200);
     const data = await res.json();
     assert.equal(data.status, 'ok');
-    assert.ok(data.models.includes('test-model'));
+    assert.ok(data.providers.includes('test-provider'));
+    assert.deepEqual(data.routes.default, { provider: 'test-provider' });
   });
 
   it('should respond to GET /v1/models', async () => {
@@ -94,7 +95,7 @@ describe('HTTP Server Integration', () => {
     const data = await res.json();
     assert.ok(Array.isArray(data.data));
     assert.equal(data.data.length, 1);
-    assert.equal(data.data[0].id, 'test-model');
+    assert.equal(data.data[0].id, 'test-provider');
     assert.equal(data.data[0].type, 'model');
     assert.equal(data.has_more, false);
   });
@@ -104,7 +105,7 @@ describe('HTTP Server Integration', () => {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        model: 'test-model',
+        model: 'test-provider',
         messages: [{ role: 'user', content: 'hi' }],
         max_tokens: 100,
       }),
@@ -129,8 +130,8 @@ describe('HTTP Server Integration', () => {
     // Create a config with no default and no matching model
     const noDefaultConfig = {
       port: TEST_PORT,
-      Router: {},
-      models: {},
+      routes: {},
+      providers: {},
     };
     writeFileSync(CONFIG_PATH, JSON.stringify(noDefaultConfig));
 
