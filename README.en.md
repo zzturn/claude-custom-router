@@ -18,20 +18,22 @@ Claude Code sends all requests to a single Anthropic API endpoint. If you want t
 ## How It Works
 
 ```
-┌─────────────┐     ┌──────────────────────┐     ┌─────────────────┐
-│ Claude Code  │────▶│  Custom Model Proxy   │────▶│  Claude API     │
-│              │     │                      │     ├─────────────────┤
-│              │     │  Routing:            │     │  GLM / DeepSeek │
-│              │     │  • Explicit override  │     │  Qwen / Others  │
-│              │     │  • Image detection    │     │  ...            │
-│              │     │  • Model ID mapping   │     └─────────────────┘
-│              │     │    (haiku/sonnet/opus)│
-│              │     │                      │◀── Custom scenarios
-│              │     └──────────────────────┘    (extensible)
-└─────────────┘
+┌──────────────┐     ┌──────────────────────────┐     ┌─────────────────┐
+│ Claude Code   │────▶│  Custom Model Proxy       │────▶│  Anthropic API  │
+│               │     │                          │     ├─────────────────┤
+│               │     │  Built-in detectors:      │     │  GLM / DeepSeek │
+│               │     │  • Explicit override (0)  │     │  Qwen / Others  │
+│               │     │  • Image detection  (5)   │     │  ...            │
+│               │     │  • Model ID mapping (8)   │     └─────────────────┘
+│               │     │    (haiku/sonnet/opus)    │
+│               │     │                          │◀── Custom detectors
+│               │     │  Direct -> providers      │    (extensible)
+│               │     │  Fallback -> routes.default│
+│               │     └──────────────────────────┘
+└──────────────┘
 ```
 
-Each request goes through a chain of **detectors** (sorted by priority). The first match determines which model handles the request.
+Each request goes through a chain of **detectors** (sorted by priority). The first match determines the target route. After all detectors, the router tries direct `providers` lookup, then falls back to `routes.default`.
 
 ## Quick Start
 
