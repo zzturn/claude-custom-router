@@ -39,6 +39,7 @@ import {
   incConn, decConn, getConns,
   selectProvider, withConnTracking,
 } from './load-balancer.mjs';
+import { buildTlsAgent } from './tls.mjs';
 import {
   MODEL_FAMILIES, detectExplicitModel, detectModelFamily, detectImage,
 } from './detectors.mjs';
@@ -77,6 +78,9 @@ const TOKEN_CHAR_RATIO = 4;
 
 /** @type {number} Maximum non-2xx response body characters to print in logs */
 const MAX_ERROR_LOG_CHARS = 4000;
+
+/** @type {import('node:https').Agent | null} Shared HTTPS agent with custom TLS config */
+let httpsAgent = null;
 
 // ─── CLI Commands ─────────────────────────────────────────────────────────────
 
@@ -285,6 +289,13 @@ function reloadConfig() {
     config.pools = parsed.pools || {};
     config.loadBalancer = parsed.loadBalancer || {};
     config.upstreamTimeoutMs = parsed.upstreamTimeoutMs || 5 * 60 * 1000;
+
+    // TLS configuration
+    const { agent, warn } = buildTlsAgent(parsed.tls);
+    const prevAgent = httpsAgent;
+    httpsAgent = agent;
+    if (prevAgent) prevAgent.destroy();
+    if (warn) L.warn(warn);
 
     config.providers = {};
     for (const [id, provider] of Object.entries(parsed.providers || {})) {
@@ -757,6 +768,7 @@ function forwardRequest(targetURL, fwdHeaders, bodyBuf, res, debugTag, sessionDi
     path: url.pathname + (url.search || ''),
     method: 'POST',
     headers: { ...fwdHeaders, host: url.host, 'content-length': bodyBuf.length },
+    ...(isHttps && httpsAgent ? { agent: httpsAgent } : {}),
   }, (proxyRes) => {
     // H2: Handle upstream response errors to prevent unhandled exception crashes
     upstreamStatusCode = proxyRes.statusCode;
@@ -874,6 +886,7 @@ function forwardNonPost(targetURL, method, reqHeaders, res, onClose) {
     path: url.pathname,
     method,
     headers: { ...reqHeaders, host: url.host },
+    ...(isHttps && httpsAgent ? { agent: httpsAgent } : {}),
   }, (proxyRes) => {
     upstreamStatusCode = proxyRes.statusCode;
     proxyRes.on('error', (e) => {

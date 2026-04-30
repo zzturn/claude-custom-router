@@ -256,6 +256,34 @@ curl http://127.0.0.1:8082/health
 | `apiKey` | 是 | API Key，支持 `${ENV_VAR}` / `$ENV_VAR` |
 | `maxTokens` | 否 | 请求中 `max_tokens` 的上限 |
 
+### TLS 配置
+
+配置文件中可通过 `tls` 字段控制上游 HTTPS 请求的证书信任行为：
+
+```json
+{
+  "tls": {
+    "trustSystemCerts": true,
+    "ca": ["/etc/ssl/certs/my-company-ca.pem"],
+    "rejectUnauthorized": true
+  }
+}
+```
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `trustSystemCerts` | boolean | `false` | 自动加载操作系统证书存储（macOS Keychain / Linux `/etc/ssl/certs`） |
+| `ca` | string[] | `[]` | 自定义 CA 证书文件路径（仅限 `/etc/ssl/certs` 等系统证书目录） |
+| `rejectUnauthorized` | boolean | `true` | 设为 `false` 可跳过证书校验（不安全，会记录警告） |
+
+**常见场景**：
+
+- **企业网络中使用代理**（如 Surge、Zscaler）：设置 `"trustSystemCerts": true`，自动信任系统 Keychain 中的企业 CA
+- **自定义 CA 证书**：通过 `ca` 指定 PEM 格式的证书文件路径
+- **开发环境跳过校验**：设置 `"rejectUnauthorized": false`（不建议在生产环境使用）
+
+> Node.js 默认使用内置的 Mozilla CA 证书列表，不读取操作系统证书存储。`trustSystemCerts` 解决了在企业网络中因中间人代理导致的证书验证失败问题。
+
 ### Route Key
 
 | 规则 | Key | 说明 |

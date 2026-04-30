@@ -259,6 +259,34 @@ Use `${ENV_VAR}` or `$ENV_VAR` syntax to reference environment variables:
 }
 ```
 
+### TLS Configuration
+
+Control upstream HTTPS certificate trust behavior via the `tls` field:
+
+```json
+{
+  "tls": {
+    "trustSystemCerts": true,
+    "ca": ["/etc/ssl/certs/my-company-ca.pem"],
+    "rejectUnauthorized": true
+  }
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `trustSystemCerts` | boolean | `false` | Auto-load OS certificate store (macOS Keychain / Linux `/etc/ssl/certs`) |
+| `ca` | string[] | `[]` | Custom CA certificate file paths (restricted to system cert directories like `/etc/ssl/certs`) |
+| `rejectUnauthorized` | boolean | `true` | Set to `false` to skip certificate verification (insecure, logs a warning) |
+
+**Common scenarios**:
+
+- **Corporate proxy** (Surge, Zscaler, etc.): Set `"trustSystemCerts": true` to trust the corporate CA from the system keychain
+- **Custom CA certificates**: Specify PEM file paths via `ca`
+- **Development bypass**: Set `"rejectUnauthorized": false` (not recommended for production)
+
+> Node.js uses its bundled Mozilla CA certificate list by default and does not read the OS certificate store. `trustSystemCerts` resolves certificate validation failures caused by corporate MITM proxies.
+
 ### Route Keys
 
 | Rule | Key | Description |

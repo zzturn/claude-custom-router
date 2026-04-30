@@ -2,6 +2,11 @@
   "port": 8082,
   "debug": false,
   "upstreamTimeoutMs": 360000,
+  "tls": {
+    "trustSystemCerts": true,
+    "ca": [],
+    "rejectUnauthorized": true
+  },
   "providers": {
     "my-default-provider": {
       "model": "actual-model-name",
