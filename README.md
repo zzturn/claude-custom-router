@@ -4,6 +4,20 @@
 
 一个轻量级、零依赖的代理服务器，根据场景检测将 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) 的 API 请求路由到不同的 LLM 提供商。
 
+> ## 🔑 意外收获：自动解锁 Auto 模式
+>
+> 这个项目最初是为了做**多 API 负载均衡**，但意外发现它天然解决了 Auto 模式解锁问题。
+>
+> **原理**：Claude Code 的 auto 模式门控检查的是模型名称（如 `claude-sonnet-4-6`）。本代理作为本地中间层，Claude Code 感知到的模型名始终是 Claude 系列，自动通过所有门控。而实际请求被路由到你配置的 DeepSeek、GLM、Qwen 等提供商。
+>
+> **效果**：无需任何二进制补丁，跨版本通用，直接使用：
+>
+> ```bash
+> claude --permission-mode auto
+> ```
+>
+> 详见下方的 [Auto 模式解锁](#auto-模式解锁) 章节。
+
 ## 为什么需要它？
 
 Claude Code 默认将所有请求发送到 Anthropic 的 API。如果你想要：
@@ -403,6 +417,88 @@ export ANTHROPIC_BASE_URL="http://127.0.0.1:8082"
 ```bash
 ANTHROPIC_BASE_URL="http://127.0.0.1:8082" claude
 ```
+
+## Auto 模式解锁
+
+这是在使用 [claude-auto-mode-unlock](https://github.com/zzturn/claude-auto-mode-unlock) 项目进行测试时的意外发现。
+
+### 背景
+
+Claude Code 的 `--permission-mode auto` 模式允许自动执行工具调用，无需逐条确认权限。但官方文档要求使用 Anthropic 官方 API 或 Bedrock 等特定渠道才能启用。
+
+通过源码分析发现，auto 模式的门控逻辑有两个检查：
+
+1. **Provider 检查** — 检测是否为 `firstParty` 或 `anthropicAws`。通过 `ANTHROPIC_BASE_URL` 指向第三方 API 时，provider 仍然是 `firstParty`（它只检查 `CLAUDE_CODE_USE_BEDROCK` 等环境变量）
+2. **模型名称检查** — 验证模型名是否匹配 `claude-(opus|sonnet)-4-6` 或 `claude-opus-4-7` 的正则
+
+### 为什么代理天然解锁
+
+```
+直连第三方 API:
+  Claude Code → "请用 auto 模式" → 检查模型名 → "deepseek-v4-flash" → ❌ 不匹配，拒绝
+
+通过代理:
+  Claude Code → "请用 auto 模式" → 检查模型名 → "claude-sonnet-4-6" → ✅ 通过
+                                                  ↓
+                                          代理路由到实际提供商
+                                                  ↓
+                                          DeepSeek / GLM / Qwen
+```
+
+代理接收 Claude Code 的请求（模型名为 `claude-sonnet-4-6`），根据配置路由到实际提供商（如 `deepseek-chat`、`glm-4`）。Claude Code 只看到 Claude 模型名，auto 模式门控自然通过。
+
+### 配置示例
+
+```json
+{
+  "providers": {
+    "deepseek": {
+      "model": "deepseek-v4-pro",
+      "baseURL": "https://api.deepseek.com/anthropic",
+      "apiKey": "${DEEPSEEK_API_KEY}"
+    },
+    "glm": {
+      "model": "glm-5.1",
+      "baseURL": "https://open.bigmodel.cn/api/anthropic",
+      "apiKey": "${GLM_API_KEY}"
+    }
+  },
+  "routes": {
+    "default": { "provider": "deepseek" },
+    "sonnet": { "pool": "sonnet-pool" }
+  },
+  "pools": {
+    "sonnet-pool": {
+      "strategy": "priority-fallback",
+      "providers": [
+        { "provider": "deepseek", "maxConns": 5 },
+        { "provider": "glm", "maxConns": 3 }
+      ]
+    }
+  }
+}
+```
+
+启动代理后，设置环境变量即可：
+
+```bash
+export ANTHROPIC_BASE_URL="http://127.0.0.1:8082"
+export ANTHROPIC_API_KEY="your-key"   # 任意值，代理会替换为配置中的 key
+claude --permission-mode auto
+```
+
+### 优势
+
+| 对比项 | 二进制补丁 | 本代理 |
+|--------|-----------|--------|
+| 跨版本兼容 | ❌ 每个版本需重新提取混淆名 | ✅ 永久有效 |
+| 升级后维护 | ❌ 每次升级需重新打补丁 | ✅ 无需任何操作 |
+| 多提供商支持 | ❌ 无 | ✅ 负载均衡 + 故障转移 |
+| 风险 | ⚠️ 修改二进制文件 | ✅ 非侵入式 |
+
+### 相关项目
+
+- [claude-auto-mode-unlock](https://github.com/zzturn/claude-auto-mode-unlock) — 二进制补丁方案（作为代理方案的备选）
 
 ## 运行测试
 
